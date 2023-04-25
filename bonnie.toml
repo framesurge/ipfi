@@ -1,0 +1,7 @@
+version="0.3.2"
+
+[scripts]
+run = [
+    "cargo build --example module",
+    "cargo run --example host -- target/debug/examples/module"
+]
