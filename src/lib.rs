@@ -1,7 +1,8 @@
+mod buffer_wire;
+mod complete_lock;
 mod interface;
 mod wire;
-mod buffer_wire;
 
+pub use crate::buffer_wire::BufferWire;
 pub use crate::interface::Interface;
 pub use crate::wire::Wire;
-pub use crate::buffer_wire::BufferWire;

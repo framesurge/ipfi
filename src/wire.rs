@@ -29,7 +29,11 @@ pub trait Wire {
         self.send_bytes(&bytes, message_idx)
     }
     /// Sends a full message over the wire, including a termination signal.
-    fn send_full_message<T: Serialize>(&mut self, data: &T, message_idx: usize) -> Result<(), Self::Error> {
+    fn send_full_message<T: Serialize>(
+        &mut self,
+        data: &T,
+        message_idx: usize,
+    ) -> Result<(), Self::Error> {
         self.send(data, message_idx)?;
         self.end_message(message_idx)?;
 

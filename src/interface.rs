@@ -1,5 +1,9 @@
-use std::{sync::{RwLock, Arc}, mem::MaybeUninit};
+use crate::complete_lock::CompleteLock;
 use serde::de::DeserializeOwned;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 /// An inter-process communication (IPC) interface based on the arbitrary reception of bytes.
 ///
@@ -13,26 +17,35 @@ use serde::de::DeserializeOwned;
 /// to send multiple messages simultaneously, while multiple receivers simultaneously wait for multiple
 /// messages. Once a message is accumulated, it will be stored in the buffer until the interface is
 /// dropped.
-pub struct Interface<const MESSAGES: usize> {
-    messages: [Arc<RwLock<(Vec<u8>, bool)>>; MESSAGES],
+pub struct Interface {
+    /// The messages received over the interface.
+    messages: Arc<RwLock<Vec<(Vec<u8>, CompleteLock)>>>,
+    /// A record of locks used to wait on the existence of a certain message
+    /// index. Since multiple threads could simultaneously wait for different message
+    /// indices, this has to be implemented this way!
+    creation_locks: Arc<RwLock<HashMap<usize, CompleteLock>>>,
 }
-impl<const MESSAGES: usize> Interface<MESSAGES> {
+impl Interface {
     /// Initializes a new interface with some other host module.
     pub fn new() -> Self {
-        // SAFETY: We're dealing with an array of `MaybeUninit`s, which don't need initialization
-        let mut arr: [MaybeUninit<Arc<RwLock<(Vec<u8>, bool)>>>; MESSAGES] = unsafe {
-            MaybeUninit::uninit().assume_init()
-        };
-        for elem in &mut arr[..] {
-            // If this panics because we've run out of memory (not impossible if we allocate too much space for messages), we'll
-            // get a memory leak on some `MaybeUninit`s, but they conveniently don't actually mean anything, so there's no memory
-            // safety issue!
-            elem.write(Arc::new(RwLock::new((Vec::new(), false))));
-        }
-        let messages = unsafe { std::mem::transmute_copy::<_, [Arc<RwLock<(Vec<u8>, bool)>>; MESSAGES]>(&arr) };
-
         Self {
-            messages,
+            messages: Arc::new(RwLock::new(Vec::new())),
+            creation_locks: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    /// Allocates space for a new message buffer, creating a new completion lock.
+    /// This will also mark a relevant completion lock as completed if one exists.
+    ///
+    /// The caller must ensure that both the messages and creation locks are accessible
+    /// when this function is called, or a deadlock will ensue.
+    fn push(&self) {
+        let mut messages = self.messages.write().unwrap();
+        let new_idx = messages.len();
+        messages.push((Vec::new(), CompleteLock::new()));
+
+        let mut creation_locks = self.creation_locks.write().unwrap();
+        if let Some(lock) = creation_locks.get_mut(&new_idx) {
+            lock.mark_complete();
         }
     }
     /// Sends the given element through to the interface, adding it to the byte array of the message with
@@ -46,16 +59,25 @@ impl<const MESSAGES: usize> Interface<MESSAGES> {
     /// blowing up the program they're sending data. Callers shoudl be careful, however, to inform the sender that
     /// they are sending data to the void.
     pub fn send(&self, datum: i8, message: usize) -> bool {
-        let message = match self.messages.get(message) {
-            Some(msg) => msg,
-            None => return false
+        let mut messages = self.messages.write().unwrap();
+        let message = if messages.len() > message {
+            // Already exists (likely partial)
+            messages.get_mut(message).unwrap()
+        } else if messages.len() == message {
+            // Next in line, we need to allocate a new entry
+            drop(messages);
+            self.push();
+            messages = self.messages.write().unwrap();
+            messages.get_mut(message).unwrap()
+        } else {
+            // Need more messages before this one, dump it
+            return false;
         };
 
-        let mut message = message.write().unwrap();
-        if message.1 {
+        if message.1.completed() {
             false
         } else if datum < 0 {
-            message.1 = true;
+            message.1.mark_complete();
             true
         } else {
             message.0.push(datum as u8);
@@ -68,13 +90,22 @@ impl<const MESSAGES: usize> Interface<MESSAGES> {
     ///
     /// This will return `false` if the given message index was out-of-bounds, or if it has already been terminated.
     pub fn send_many(&self, data: &[u8], message: usize) -> bool {
-        let message = match self.messages.get(message) {
-            Some(msg) => msg,
-            None => return false
+        let mut messages = self.messages.write().unwrap();
+        let message = if messages.len() > message {
+            // Already exists (likely partial)
+            messages.get_mut(message).unwrap()
+        } else if messages.len() == message {
+            // Next in line, we need to allocate a new entry
+            drop(messages);
+            self.push();
+            messages = self.messages.write().unwrap();
+            messages.get_mut(message).unwrap()
+        } else {
+            // Need more messages before this one, dump it
+            return false;
         };
 
-        let mut message = message.write().unwrap();
-        if message.1 {
+        if message.1.completed() {
             false
         } else {
             message.0.extend(data);
@@ -84,16 +115,26 @@ impl<const MESSAGES: usize> Interface<MESSAGES> {
     /// Explicitly terminates the message with the given index. This will return `true` if it was possible, or `false`
     /// if the message had already been terminated (or if it is out-of-bounds).
     pub fn terminate_message(&self, message: usize) -> bool {
-        let message = match self.messages.get(message) {
-            Some(msg) => msg,
-            None => return false
+        let mut messages = self.messages.write().unwrap();
+        let message = if messages.len() > message {
+            // Already exists (likely partial)
+            messages.get_mut(message).unwrap()
+        } else if messages.len() == message {
+            // Next in line, we need to allocate a new entry
+            // This is possible for a termination operation if the message is zero-sized
+            drop(messages);
+            self.push();
+            messages = self.messages.write().unwrap();
+            messages.get_mut(message).unwrap()
+        } else {
+            // Need more messages before this one, dump it
+            return false;
         };
 
-        let mut message = message.write().unwrap();
-        if message.1 {
+        if message.1.completed() {
             false
         } else {
-            message.1 = true;
+            message.1.mark_complete();
             true
         }
     }
@@ -111,19 +152,44 @@ impl<const MESSAGES: usize> Interface<MESSAGES> {
     ///
     /// This will panic if the given message index is out-of-bounds for this interface. Since the caller instantiates
     /// this interface with its message size, they should check this before calling this method.
-    pub fn get_raw(&self, message: usize) -> Vec<u8> {
-        let message = match self.messages.get(message) {
-            Some(msg) => msg,
-            // Clearer error than a simple out-of-bounds
-            None => panic!("attempted to get message at index '{}' from interface with max index '{}'", message, MESSAGES - 1)
+    pub fn get_raw(&self, message_idx: usize) -> Vec<u8> {
+        // We need two completion locks to be ready before we're ready: the first is
+        // a creation lock on the message index, and the second is a lock on its
+        // actual completion. We'll start by creating a new completion lock if one
+        // doesn't already exist. Any future creations will thereby trigger it. Of
+        // course, we won't need to do this if the entry already exists.
+        let message_lock = {
+            // Mutable for reassignment
+            let mut messages = self.messages.read().unwrap();
+            let message = if let Some(message) = messages.get(message_idx) {
+                message
+            } else {
+                drop(messages);
+                // Mutable for reassignment
+                let creation_locks = self.creation_locks.read().unwrap();
+                let lock = if let Some(lock) = creation_locks.get(&message_idx) {
+                    let lock = lock.clone();
+                    drop(creation_locks);
+                    lock
+                } else {
+                    let lock = CompleteLock::new();
+                    // Upgrade to a writeable lock
+                    drop(creation_locks);
+                    let mut creation_locks_w = self.creation_locks.write().unwrap();
+                    creation_locks_w.insert(message_idx, lock.clone());
+                    lock
+                };
+
+                lock.wait_for_completion();
+                messages = self.messages.read().unwrap();
+                messages.get(message_idx).unwrap()
+            };
+            message.1.clone()
         };
 
-        // Wait until this message is completed
-        while !message.read().unwrap().1 {
-            // Don't just loop on every tick, give the system some time to receive data
-            std::thread::yield_now();
-        }
+        message_lock.wait_for_completion();
 
-        message.read().unwrap().0.to_vec()
+        let messages = self.messages.read().unwrap();
+        messages[message_idx].0.to_vec()
     }
 }
