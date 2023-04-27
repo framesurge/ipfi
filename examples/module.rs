@@ -23,10 +23,29 @@ fn main() {
 
     // We expect a few messages from the host: this code will block until the above thread has
     // read each of them into the interface (which is thread-safe)
-    let first_name: String = INTERFACE.get(0).unwrap();
-    eprintln!("Got first name from host: {}!", first_name);
-    let last_name: String = INTERFACE.get(1).unwrap();
-    eprintln!("Got last name from host: {}!", last_name);
+    //
+    // Again, on Wasm we'll read these sequentially, but we'll read everything concurrently
+    // anywhere else (not necessary, just shows the thread safety).
+    let r1 = || {
+        let first_name: String = INTERFACE.get(0).unwrap();
+        eprintln!("Got first name from host: {}!", first_name);
+    };
+    let r2 = || {
+        let last_name: String = INTERFACE.get(1).unwrap();
+        eprintln!("Got last name from host: {}!", last_name);
+    };
+    #[cfg(target_arch = "wasm32")]
+    {
+        r1();
+        r2();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let t1 = std::thread::spawn(r1);
+        let t2 = std::thread::spawn(r2);
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
 
     // And write a response to the host (remember that the message indices are separated for read and write)
     write_wire
