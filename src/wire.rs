@@ -429,6 +429,7 @@ impl<'a> Wire<'a> {
 
 /// A handle for waiting on the return values of remote procedure calls. This is necessary because calling a remote procedure
 /// requires `.flush()` to be called, so waiting inside a function like `.call()` would make very little sense.
+#[derive(Clone)]
 pub struct CallHandle<'a> {
     /// The message index to wait for. If this is improperly initialised, we will probably get completely different and almost
     /// certainly invalid data.
@@ -566,4 +567,138 @@ pub fn signal_termination(writer: &mut impl Write) -> Result<(), std::io::Error>
     writer.flush()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Wire;
+    use crate::Interface;
+    use std::io::Cursor;
+
+    struct Actor {
+        interface: &'static Interface,
+        wire: Wire<'static>,
+        input: Cursor<Vec<u8>>,
+    }
+    impl Actor {
+        fn new() -> Self {
+            let interface = Box::leak(Box::new(Interface::new()));
+            let wire = Wire::new(interface);
+            Self {
+                interface,
+                wire,
+                input: Cursor::new(Vec::new()),
+            }
+        }
+        fn reset_input(&mut self) {
+            self.input.set_position(0);
+        }
+    }
+
+    #[test]
+    fn message_should_be_propagated_to_interface() {
+        let host = Actor::new();
+        let mut module = Actor::new();
+
+        // Test writing a general message and everything associated therewith
+        assert!(host
+            .wire
+            .send_full_message(&"Hello, world!".to_string(), 0)
+            .is_ok());
+        // Test writing it to an output buffer
+        assert!(host.wire.flush(&mut module.input).is_ok());
+        // We should receive the message, and then a terminator
+        module.reset_input();
+        for _ in 0..2 {
+            // Test receiving system
+            assert!(module.wire.receive_one(&mut module.input).is_ok());
+        }
+
+        // The message should have been passed to the interface
+        let msg = module.interface.get::<String>(0);
+        assert!(msg.is_ok());
+        assert_eq!(msg.unwrap(), "Hello, world!");
+    }
+    #[test]
+    fn partial_message_should_work() {
+        let host = Actor::new();
+        let mut module = Actor::new();
+
+        let msg = rmp_serde::encode::to_vec("Hello, world!").unwrap();
+        let first_partial = &msg[0..5];
+        let second_partial = &msg[5..10];
+        let third_partial = &msg[10..];
+
+        assert!(host.wire.send_bytes(first_partial, 0).is_ok());
+        assert!(host.wire.send_bytes(second_partial, 0).is_ok());
+        assert!(host.wire.send_bytes(third_partial, 0).is_ok());
+        assert!(host.wire.end_message(0).is_ok());
+
+        assert!(host.wire.flush(&mut module.input).is_ok());
+        module.reset_input();
+        // First, second, third, end
+        for _ in 0..4 {
+            assert!(module.wire.receive_one(&mut module.input).is_ok());
+        }
+
+        let msg = module.interface.get::<String>(0);
+        assert!(msg.is_ok());
+        assert_eq!(msg.unwrap(), "Hello, world!");
+    }
+    #[test]
+    fn spurious_reconstitution_should_fail() {
+        let host = Actor::new();
+        let mut module = Actor::new();
+
+        let msg = rmp_serde::encode::to_vec("Hello, world!").unwrap();
+        let first_partial = &msg[0..5];
+        let second_partial = &msg[5..10];
+
+        assert!(host.wire.send_bytes(first_partial, 0).is_ok());
+        assert!(host.wire.send_bytes(second_partial, 0).is_ok());
+
+        // Try a premature termination and make sure the message can't be spuriously reconstituted
+        assert!(host.wire.end_message(0).is_ok());
+
+        assert!(host.wire.flush(&mut module.input).is_ok());
+        module.reset_input();
+        // First, second, end
+        for _ in 0..3 {
+            assert!(module.wire.receive_one(&mut module.input).is_ok());
+        }
+
+        let msg = module.interface.get::<String>(0);
+        assert!(msg.is_err());
+    }
+    #[test]
+    fn no_args_procedure_call_should_work() {
+        fn procedure(_: ()) -> u32 {
+            42
+        }
+        let mut host = Actor::new();
+        let mut module = Actor::new();
+
+        host.interface.add_procedure(0, procedure);
+        let handle = module.wire.call(0, ());
+        assert!(handle.is_ok());
+        let handle = handle.unwrap();
+        assert!(module.wire.flush(&mut host.input).is_ok());
+        host.reset_input();
+
+        // Call and termination are one for no-args calls!
+        for _ in 0..1 {
+            assert!(host.wire.receive_one(&mut host.input).is_ok());
+        }
+        // Function has been autoamtically called by the wire
+        assert!(host.wire.flush(&mut module.input).is_ok());
+        module.input.set_position(0); // Manual reset to avoid lifetime problems on `Actor`
+
+        // Result, termination
+        for _ in 0..2 {
+            assert!(module.wire.receive_one(&mut module.input).is_ok());
+        }
+        let result = handle.wait::<u32>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 42);
+    }
 }
