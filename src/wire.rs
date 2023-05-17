@@ -68,17 +68,14 @@ impl<'a> Wire<'a> {
     //     Self::new(stdin, stdout, interface)
     // }
 
-    /// Calls the procedure with the given remote procedure index. This will block waiting for the return value from the
-    /// remote procedure.
+    /// Calls the procedure with the given remote procedure index. This will return a handle you can use to block waiting
+    /// for the return value of the procedure.
     ///
     /// Generally, this should be preferred as a high-level method, although several lower-level methods are available for
-    /// sending one argument at a time, or similar piecemeal use-cases. If you do not wish to wait on the return value of
-    /// the procedure call, `.call_with_full_args()` may be preferable to this function.
-    pub fn call<T: DeserializeOwned>(&self, procedure_idx: usize, args: impl ProcedureArgs) -> Result<T, Error> {
-        let response_idx = self.call_with_full_args(procedure_idx, args)?;
-        let ret = self.interface.get(response_idx)?;
-
-        Ok(ret)
+    /// sending one argument at a time, or similar piecemeal use-cases.
+    pub fn call(&self, procedure_idx: usize, args: impl ProcedureArgs) -> Result<CallHandle, Error> {
+        let args = args.into_bytes()?;
+        self.call_with_bytes(procedure_idx, &args)
     }
 
     // --- Low-level procedure calling methods ---
@@ -129,22 +126,11 @@ impl<'a> Wire<'a> {
 
         Ok(call_idx)
     }
-    /// Same as `.start_call_with_partial_args()`, except this expects to be given all the procedure arguments, and will
-    /// automatically transmit a second message telling the remote that the procedure call is over and ready to be executed.
-    /// This will *not* wait for the return value the remote sends for this procedure call.
-    ///
-    /// This will return the index of the local message buffer where the return value of this procedure will be received,
-    /// allowing the caller to wait for it.
+    /// Same as `.call()`, but this works directly with bytes. You must be careful to provide the full byte serialization here,
+    /// and be sure to follow the above guidance on this! (I.e. you must not include the length marker.)
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn call_with_full_args(&self, procedure_idx: usize, args: impl ProcedureArgs) -> Result<usize, Error> {
-        let args = args.into_bytes()?;
-        self.call_with_full_bytes(procedure_idx, &args)
-    }
-    /// Same as `.call_with_full_args()`, but this works directly with bytes.
-    ///
-    /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn call_with_full_bytes(&self, procedure_idx: usize, args: &[u8]) -> Result<usize, Error> {
+    pub fn call_with_bytes(&self, procedure_idx: usize, args: &[u8]) -> Result<CallHandle, Error> {
         // We allow zero-length payloads here (for functions with no arguments in particular)
         let call_idx = self.start_call_with_partial_bytes(procedure_idx, args)?;
         self.end_given_call(procedure_idx, call_idx)
@@ -184,11 +170,10 @@ impl<'a> Wire<'a> {
     }
     /// Terminates the given call by sending a zero-length argument payload.
     ///
-    /// This will return the index of the local message buffer where the return value of this procedure will be received,
-    /// allowing the caller to wait for it.
+    /// This will return a handle the caller can use to wait on the return value of the remote procedure.
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn end_given_call(&self, procedure_idx: usize, call_idx: usize) -> Result<usize, Error> {
+    pub fn end_given_call(&self, procedure_idx: usize, call_idx: usize) -> Result<CallHandle, Error> {
         // Get the response index we're using
         let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
         // Construct the zero-length payload message we want to send
@@ -202,7 +187,10 @@ impl<'a> Wire<'a> {
         let bytes = msg.to_bytes()?;
         self.queue.lock().unwrap().push(bytes);
 
-        Ok(response_idx)
+        Ok(CallHandle {
+            response_idx,
+            interface: self.interface,
+        })
     }
     /// Gets the local response buffer index for the given procedure and call indices. If no such buffer has been allocated,
     /// this will return an error.
@@ -292,7 +280,13 @@ impl<'a> Wire<'a> {
                         message: &ret
                     };
                     let ret_msg_bytes = ret_msg.to_bytes()?;
-                    self.queue.lock().unwrap().push(ret_msg_bytes)
+                    let mut queue = self.queue.lock().unwrap();
+                    queue.push(ret_msg_bytes);
+                    // And now we need to terminate that result message
+                    queue.push(Message::General {
+                        message_idx: response_idx,
+                        message: &[]
+                    }.to_bytes()?);
                 } else {
                     // We're continuing or starting a new partial procedure argument addition, so get a local message
                     // buffer for it if there isn't already one
@@ -351,6 +345,23 @@ impl<'a> Wire<'a> {
     // TODO
     pub fn fill(&self) -> Result<(), std::io::Error> {
         todo!()
+    }
+}
+
+/// A handle for waiting on the return values of remote procedure calls. This is necessary because calling a remote procedure
+/// requires `.flush()` to be called, so waiting inside a function like `.call()` would make very little sense.
+pub struct CallHandle<'a> {
+    /// The message index to wait for. If this is improperly initialised, we will probably get completely different and almost
+    /// certainly invalid data.
+    response_idx: usize,
+    /// The interface where the response will appear.
+    interface: &'a Interface,
+}
+impl<'a> CallHandle<'a> {
+    /// Waits for the procedure call to complete and returns the result. This will block.
+    #[inline]
+    pub fn wait<T: DeserializeOwned>(&self) -> Result<T, Error> {
+        self.interface.get(self.response_idx)
     }
 }
 

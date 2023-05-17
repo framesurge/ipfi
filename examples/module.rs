@@ -5,9 +5,13 @@ use once_cell::sync::Lazy;
 static INTERFACE: Lazy<Interface> = Lazy::new(|| Interface::new());
 
 fn main() {
+    INTERFACE.add_procedure(0, print_hello);
+
     let wire = Wire::new(&INTERFACE);
     let reader = move || {
-        while wire.receive_one(&mut std::io::stdin()).is_ok() {}
+        while wire.receive_one(&mut std::io::stdin()).is_ok() {
+            wire.flush(&mut std::io::stdout()).unwrap();
+        }
     };
     // On Wasm, we have no threads, so we're forced to read all messages at once (we
     // could read a specified number at a time, or we could read until EOF, which is why
@@ -49,4 +53,8 @@ fn main() {
     // write_wire
     //     .send_full_message(&"Thanks very much!".to_string(), 0)
     //     .unwrap();
+}
+
+fn print_hello((name,): (String,)) -> String {
+    format!("Hey there, {}!", name)
 }
