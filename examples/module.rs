@@ -55,6 +55,6 @@ fn main() {
     //     .unwrap();
 }
 
-fn print_hello((name,): (String,)) -> String {
-    format!("Hey there, {}!", name)
+fn print_hello(_: ()) {
+    eprintln!("Hey there!");
 }

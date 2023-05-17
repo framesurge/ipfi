@@ -46,13 +46,14 @@ fn main() {
     // std::thread::sleep(std::time::Duration::from_secs(1));
     wire.send_full_message(&"Doe".to_string(), 1).unwrap();
 
-    let greeting_handle = wire.call(0, ("Sam".to_string(),)).unwrap();
+    let greeting_handle = wire.call(0, ()).unwrap();
     wire.flush(child_stdin).unwrap();
+    // Always two messages after a procedure call
     wire.receive_one(child.stdout.as_mut().unwrap()).unwrap();
     wire.receive_one(child.stdout.as_mut().unwrap()).unwrap();
 
-    let greeting: String = greeting_handle.wait().unwrap();
-    println!("{}", greeting);
+    let _: () = greeting_handle.wait().unwrap();
+    // println!("{}", greeting);
 
     // // Move into a new scope, where we'll create the wire from mutable borrows of the child's stdio,
     // // which we have to drop before we can wait on it

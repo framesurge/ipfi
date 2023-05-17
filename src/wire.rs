@@ -1,7 +1,11 @@
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{interface::Interface, procedure_args::ProcedureArgs, error::Error};
-use std::{io::{self, Read, Write}, sync::{Arc, Mutex}, collections::HashMap};
+use crate::{error::Error, interface::Interface, procedure_args::ProcedureArgs};
+use std::{
+    collections::HashMap,
+    io::{self, Read, Write},
+    sync::{Arc, Mutex},
+};
 
 /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
 ///
@@ -73,7 +77,11 @@ impl<'a> Wire<'a> {
     ///
     /// Generally, this should be preferred as a high-level method, although several lower-level methods are available for
     /// sending one argument at a time, or similar piecemeal use-cases.
-    pub fn call(&self, procedure_idx: usize, args: impl ProcedureArgs) -> Result<CallHandle, Error> {
+    pub fn call(
+        &self,
+        procedure_idx: usize,
+        args: impl ProcedureArgs,
+    ) -> Result<CallHandle, Error> {
         let args = args.into_bytes()?;
         self.call_with_bytes(procedure_idx, &args)
     }
@@ -87,7 +95,11 @@ impl<'a> Wire<'a> {
     /// of the local message buffer where the response is held will be returned when the call is completed.
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn start_call_with_partial_args(&self, procedure_idx: usize, args: impl ProcedureArgs) -> Result<usize, Error> {
+    pub fn start_call_with_partial_args(
+        &self,
+        procedure_idx: usize,
+        args: impl ProcedureArgs,
+    ) -> Result<usize, Error> {
         let args = args.into_bytes()?;
         self.start_call_with_partial_bytes(procedure_idx, &args)
     }
@@ -95,7 +107,11 @@ impl<'a> Wire<'a> {
     /// like a two-thirds of an argument.
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn start_call_with_partial_bytes(&self, procedure_idx: usize, args: &[u8]) -> Result<usize, Error> {
+    pub fn start_call_with_partial_bytes(
+        &self,
+        procedure_idx: usize,
+        args: &[u8],
+    ) -> Result<usize, Error> {
         if args.len() == 0 {
             return Err(Error::ZeroLengthInNonTerminating);
         }
@@ -132,7 +148,42 @@ impl<'a> Wire<'a> {
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
     pub fn call_with_bytes(&self, procedure_idx: usize, args: &[u8]) -> Result<CallHandle, Error> {
         // We allow zero-length payloads here (for functions with no arguments in particular)
-        let call_idx = self.start_call_with_partial_bytes(procedure_idx, args)?;
+
+        let mut rcc = self.remote_call_counter.lock().unwrap();
+        // Create a new entry in the remote call counter for this call index
+        let call_idx = if let Some(last_call_idx) = rcc.get(&procedure_idx).as_mut() {
+            // We need to update what's in there
+            let new_call_idx = *last_call_idx + 1;
+            *last_call_idx = &new_call_idx;
+            new_call_idx
+        } else {
+            // We need to insert a new entry
+            rcc.insert(procedure_idx, 0);
+            0
+        };
+        // Allocate a new message buffer on the interface that we'll receive the response into
+        let response_idx = self.interface.push();
+        // Add that to the remote index map so we can retrieve it for later continutation and termination
+        // of this call
+        {
+            let mut rim = self.response_idx_map.lock().unwrap();
+            rim.insert((procedure_idx, call_idx), response_idx);
+        }
+
+        // Get the response index we're using
+        let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+        // Construct the message we want to send
+        let msg = Message::Call {
+            procedure_idx,
+            call_idx,
+            response_idx,
+            args,
+        };
+        // Convert that message into bytes and place it in the queue
+        let bytes = msg.to_bytes()?;
+        self.queue.lock().unwrap().push(bytes);
+
+        // And neither does this
         self.end_given_call(procedure_idx, call_idx)
     }
     /// Continues the procedure call with the given remote procedure index and call index by sending the given arguments.
@@ -141,14 +192,24 @@ impl<'a> Wire<'a> {
     /// For an explanation of how call indices work, see [`Wire`].
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn continue_given_call_with_args(&self, procedure_idx: usize, call_idx: usize, args: impl ProcedureArgs) -> Result<(), Error> {
+    pub fn continue_given_call_with_args(
+        &self,
+        procedure_idx: usize,
+        call_idx: usize,
+        args: impl ProcedureArgs,
+    ) -> Result<(), Error> {
         let args = args.into_bytes()?;
         self.continue_given_call_with_bytes(procedure_idx, call_idx, &args)
     }
     /// Same as `.continue_given_call_with_args()`, but this works directly with bytes.
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn continue_given_call_with_bytes(&self, procedure_idx: usize, call_idx: usize, args: &[u8]) -> Result<(), Error> {
+    pub fn continue_given_call_with_bytes(
+        &self,
+        procedure_idx: usize,
+        call_idx: usize,
+        args: &[u8],
+    ) -> Result<(), Error> {
         if args.len() == 0 {
             return Err(Error::ZeroLengthInNonTerminating);
         }
@@ -173,7 +234,11 @@ impl<'a> Wire<'a> {
     /// This will return a handle the caller can use to wait on the return value of the remote procedure.
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn end_given_call(&self, procedure_idx: usize, call_idx: usize) -> Result<CallHandle, Error> {
+    pub fn end_given_call(
+        &self,
+        procedure_idx: usize,
+        call_idx: usize,
+    ) -> Result<CallHandle, Error> {
         // Get the response index we're using
         let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
         // Construct the zero-length payload message we want to send
@@ -197,7 +262,12 @@ impl<'a> Wire<'a> {
     #[inline]
     fn get_response_idx(&self, procedure_idx: usize, call_idx: usize) -> Result<usize, Error> {
         let rim = self.response_idx_map.lock().unwrap();
-        rim.get(&(procedure_idx, call_idx)).cloned().ok_or(Error::NoResponseBuffer { index: procedure_idx, call_idx })
+        rim.get(&(procedure_idx, call_idx))
+            .cloned()
+            .ok_or(Error::NoResponseBuffer {
+                index: procedure_idx,
+                call_idx,
+            })
     }
 
     /// Sends the given raw bytes over the wire, with the given message index, which will correspond to that index in the
@@ -215,7 +285,11 @@ impl<'a> Wire<'a> {
         Ok(())
     }
     /// Sends the given full message over the wire to the given remote message buffer index.
-    pub fn send_full_message<T: Serialize>(&self, msg: &T, message_idx: usize) -> Result<(), Error> {
+    pub fn send_full_message<T: Serialize>(
+        &self,
+        msg: &T,
+        message_idx: usize,
+    ) -> Result<(), Error> {
         let bytes = rmp_serde::to_vec(msg)?;
         self.send_bytes(&bytes, message_idx)?;
         self.end_message(message_idx)
@@ -266,7 +340,9 @@ impl<'a> Wire<'a> {
                 let num_bytes = u32::from_le_bytes(len_buf) as usize;
 
                 // We need to know where to put argument information
-                let call_buf_idx = self.interface.get_call_buffer(procedure_idx, call_idx, self.id);
+                let call_buf_idx = self
+                    .interface
+                    .get_call_buffer(procedure_idx, call_idx, self.id);
 
                 // If there were no arguments, we should call the procedure (we either allegedly have everything, or
                 // the procedure takes no arguments in the first place)
@@ -277,16 +353,19 @@ impl<'a> Wire<'a> {
                     let ret = self.interface.call_procedure(procedure_idx, call_buf_idx)?;
                     let ret_msg = Message::General {
                         message_idx: response_idx,
-                        message: &ret
+                        message: &ret,
                     };
                     let ret_msg_bytes = ret_msg.to_bytes()?;
                     let mut queue = self.queue.lock().unwrap();
                     queue.push(ret_msg_bytes);
                     // And now we need to terminate that result message
-                    queue.push(Message::General {
-                        message_idx: response_idx,
-                        message: &[]
-                    }.to_bytes()?);
+                    queue.push(
+                        Message::General {
+                            message_idx: response_idx,
+                            message: &[],
+                        }
+                        .to_bytes()?,
+                    );
                 } else {
                     // We're continuing or starting a new partial procedure argument addition, so get a local message
                     // buffer for it if there isn't already one
@@ -297,7 +376,7 @@ impl<'a> Wire<'a> {
                     // This will accumulate argument bytes over potentially many continuations in the local call buffer
                     self.interface.send_many(&bytes, call_buf_idx)?;
                 }
-            },
+            }
             // General message
             2 => {
                 // First is the message index
@@ -319,12 +398,12 @@ impl<'a> Wire<'a> {
 
                     self.interface.send_many(&bytes, message_idx)?;
                 }
-            },
+            }
             // Termination: the other program is shutting down and is no longer capable of receiving messages
             // This is the IPFI equivalent of 'expected EOF'
             0 => {
                 todo!()
-            },
+            }
             // Unknown message types will be ignored
             _ => {}
         }
@@ -377,8 +456,8 @@ enum Message<'b> {
     /// A message that calls a procedure. This, like any other message, may have a partial payload.
     Call {
         procedure_idx: usize, // Remote
-        call_idx: usize, // Remote
-        response_idx: usize, // Local
+        call_idx: usize,      // Remote
+        response_idx: usize,  // Local
 
         args: &'b [u8],
     },
@@ -427,8 +506,13 @@ impl<'b> Message<'b> {
         match &self {
             Self::Termination => {
                 buf.write_all(&[0])?;
-            },
-            Self::Call { procedure_idx, call_idx, response_idx, args } => {
+            }
+            Self::Call {
+                procedure_idx,
+                call_idx,
+                response_idx,
+                args,
+            } => {
                 buf.write_all(&[1])?;
                 // Step 1
                 let procedure_idx = (*procedure_idx as u32).to_le_bytes();
@@ -447,8 +531,11 @@ impl<'b> Message<'b> {
                 if args.len() > 0 {
                     buf.write_all(args)?;
                 }
-            },
-            Self::General { message_idx, message } => {
+            }
+            Self::General {
+                message_idx,
+                message,
+            } => {
                 buf.write_all(&[2])?;
                 // Step 1
                 let message_idx = (*message_idx as u32).to_le_bytes();

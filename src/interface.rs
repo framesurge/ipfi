@@ -2,7 +2,7 @@ use crate::{complete_lock::CompleteLock, error::Error, procedure_args::Tuple};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 /// A procedure registered on an interface.
@@ -87,23 +87,35 @@ impl Interface {
     /// within the procedure itself, otherwise any program could use IPFI to pass invalid integers. Alternately, you can use a custom
     /// serialization/deserialization process to uphold invariants, provided you are satisfied that is secure against totally untrusted
     /// input.
-    pub fn add_procedure<A: Serialize + DeserializeOwned + Tuple, R: Serialize + DeserializeOwned>(&self, idx: usize, f: impl Fn(A) -> R + Send + Sync + 'static) {
+    pub fn add_procedure<
+        A: Serialize + DeserializeOwned + Tuple,
+        R: Serialize + DeserializeOwned,
+    >(
+        &self,
+        idx: usize,
+        f: impl Fn(A) -> R + Send + Sync + 'static,
+    ) {
         let closure = Box::new(move |data: &[u8]| {
             // Add the correct length prefix so this can be deserialized as the tuple it is (this is what allows
             // piecemeal argument transmission)
-            let mut bytes = Vec::new();
-            rmp::encode::write_array_len(&mut bytes, A::len() as u32).map_err(|_| Error::WriteLenMarkerFailed)?;
-            bytes.extend(data);
+            let arg_tuple = if A::len() == 0 {
+                // If the function takes no arguments, the length marker hack doesn't work
+                rmp_serde::decode::from_slice(&rmp_serde::encode::to_vec(&())?)?
+            } else {
+                let mut bytes = Vec::new();
+                rmp::encode::write_array_len(&mut bytes, A::len() as u32)
+                    .map_err(|_| Error::WriteLenMarkerFailed)?;
+                bytes.extend(data);
 
-            let arg_tuple = rmp_serde::decode::from_slice(&bytes)?;
+                rmp_serde::decode::from_slice(&bytes)?
+            };
+
             let ret = f(arg_tuple);
             let ret = rmp_serde::encode::to_vec(&ret)?;
 
             Ok(ret)
         });
-        let procedure = Procedure {
-            closure,
-        };
+        let procedure = Procedure { closure };
         self.procedures.write().unwrap().insert(idx, procedure);
     }
     /// Calls the procedure with the given index, returning the raw serialized byte vector it produces. This will get its
@@ -112,7 +124,11 @@ impl Interface {
     ///
     /// There is no method provided to avoid byte serialization, because procedure calls over IPFI are intended to be made solely by
     /// remote communicators.
-    pub fn call_procedure(&self, procedure_idx: usize, args_buf_idx: usize) -> Result<Vec<u8>, Error> {
+    pub fn call_procedure(
+        &self,
+        procedure_idx: usize,
+        args_buf_idx: usize,
+    ) -> Result<Vec<u8>, Error> {
         if let Some(procedure) = self.procedures.read().unwrap().get(&procedure_idx) {
             let messages = self.messages.read().unwrap();
             if let Some((args, complete_lock)) = messages.get(args_buf_idx) {
@@ -120,13 +136,19 @@ impl Interface {
                     // The length marker will be inserted by the internal wrapper closure
                     (procedure.closure)(args)
                 } else {
-                    Err(Error::CallBufferIncomplete { index: args_buf_idx })
+                    Err(Error::CallBufferIncomplete {
+                        index: args_buf_idx,
+                    })
                 }
             } else {
-                Err(Error::NoCallBuffer { index: args_buf_idx })
+                Err(Error::NoCallBuffer {
+                    index: args_buf_idx,
+                })
             }
         } else {
-            Err(Error::NoSuchProcedure { index: procedure_idx })
+            Err(Error::NoSuchProcedure {
+                index: procedure_idx,
+            })
         }
     }
     /// Gets the index of a local message buffer to be used to store the given call of the given procedure from the given wire.
@@ -185,7 +207,10 @@ impl Interface {
             messages.get_mut(message_idx).unwrap()
         } else {
             // Need more messages before this one, dump it
-            return Err(Error::OutOfBounds { index: message_idx, max_idx: messages.len() - 1 });
+            return Err(Error::OutOfBounds {
+                index: message_idx,
+                max_idx: messages.len() - 1,
+            });
         };
 
         if message.1.completed() {
@@ -214,7 +239,10 @@ impl Interface {
             messages.get_mut(message_idx).unwrap()
         } else {
             // Need more messages before this one, dump it
-            return Err(Error::OutOfBounds { index: message_idx, max_idx: messages.len() - 1 });
+            return Err(Error::OutOfBounds {
+                index: message_idx,
+                max_idx: messages.len() - 1,
+            });
         };
 
         if message.1.completed() {
@@ -240,7 +268,10 @@ impl Interface {
             messages.get_mut(message_idx).unwrap()
         } else {
             // Need more messages before this one, dump it
-            return Err(Error::OutOfBounds { index: message_idx, max_idx: messages.len() - 1 });
+            return Err(Error::OutOfBounds {
+                index: message_idx,
+                max_idx: messages.len() - 1,
+            });
         };
 
         if message.1.completed() {
