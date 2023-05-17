@@ -29,14 +29,14 @@ pub struct Procedure {
 /// dropped.
 pub struct Interface {
     /// The messages received over the interface.
-    messages: Arc<RwLock<Vec<(Vec<u8>, CompleteLock)>>>,
+    messages: RwLock<Vec<(Vec<u8>, CompleteLock)>>,
     /// A record of locks used to wait on the existence of a certain message
     /// index. Since multiple threads could simultaneously wait for different message
     /// indices, this has to be implemented this way!
-    creation_locks: Arc<RwLock<HashMap<usize, CompleteLock>>>,
+    creation_locks: RwLock<HashMap<usize, CompleteLock>>,
     /// A list of procedures registered on this interface that those communicating with this
     /// program may execute.
-    procedures: Arc<RwLock<HashMap<usize, Procedure>>>,
+    procedures: RwLock<HashMap<usize, Procedure>>,
     /// A map of procedure call indices and the wire IDs that produced them to local message buffer addresses.
     /// These are necessary because, when a program sends a partial procedure call, and then later completes it,
     /// we need to know that the two messages are part of the same call. On their side, the caller will maintain
@@ -44,7 +44,7 @@ pub struct Interface {
     /// as necessary.
     ///
     /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
-    call_to_buffer_map: Arc<Mutex<HashMap<(usize, usize, usize), usize>>>,
+    call_to_buffer_map: Mutex<HashMap<(usize, usize, usize), usize>>,
     /// The unique numerical identifier that will be used for the next wire that connects to this interface.
     /// We map call indices to message buffers, but, since one interface can be used to connect to many wires,
     /// call indices are likely to overlap, so every wire must have a unique identifier. Instead of pulling
@@ -56,10 +56,10 @@ impl Interface {
     /// or through manual communication management.
     pub fn new() -> Self {
         Self {
-            messages: Arc::new(RwLock::new(Vec::new())),
-            creation_locks: Arc::new(RwLock::new(HashMap::new())),
-            procedures: Arc::new(RwLock::new(HashMap::new())),
-            call_to_buffer_map: Arc::new(Mutex::new(HashMap::new())),
+            messages: RwLock::new(Vec::new()),
+            creation_locks: RwLock::new(HashMap::new()),
+            procedures: RwLock::new(HashMap::new()),
+            call_to_buffer_map: Mutex::new(HashMap::new()),
             next_wire_id: Mutex::new(0),
         }
     }
@@ -281,22 +281,6 @@ impl Interface {
             Ok(())
         }
     }
-    // /// Gets an object of the given type from the module interface, specifically from the *next*
-    // /// unread message. To determine what the latest unread message is, a counter should
-    // /// be provided to this method, which will be incremented as necessary. This allows
-    // /// the caller to manage whether the read queue should be thread-local or shared, since
-    // /// both approaches have system-specific benefits.
-    // ///
-    // /// **IMPORTANT:** If this returns an error, the given counter will **not** have been incremented!
-    // /// It will only be incremented if the message was successfully read and deserialized.
-    // pub fn get_next<T: DeserializeOwned>(&self, counter: &mut usize) -> Result<T, rmp_serde::decode::Error> {
-    //     let message = self.get(*counter);
-    //     // Only increment if message deserialization didn't fail
-    //     if message.is_ok() {
-    //         *counter += 1;
-    //     }
-    //     message
-    // }
     /// Gets an object of the given type from the given message buffer index of the interface. This will block
     /// waiting for the given message buffer to be (1) created and (2) marked as complete. Depending on the
     /// caller's behaviour, this may block forever if they never complete the message.
@@ -305,14 +289,6 @@ impl Interface {
         let decoded = rmp_serde::decode::from_slice(&message)?;
         Ok(decoded)
     }
-    // /// Gets the next message as a raw byte array. See `.get_next()` for the semantics
-    // /// of getting the next message in any form.
-    // pub fn get_next_raw(&self, counter: &mut usize) -> Vec<u8> {
-    //     let message = self.get_raw(*counter);
-    //     // We do this after to avoid any panics leading to a broken counter state
-    //     *counter += 1;
-    //     message
-    // }
     /// Same as `.get()`, but gets the raw byte array instead. Note that this will copy the underlying bytes to return
     /// them outside the thread-lock.
     ///
@@ -356,5 +332,144 @@ impl Interface {
 
         let messages = self.messages.read().unwrap();
         messages[message_idx].0.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Interface;
+
+    fn has_duplicates<T: Eq + std::hash::Hash>(vec: &[T]) -> bool {
+        let mut set = std::collections::HashSet::new();
+        vec.iter().any(|x| !set.insert(x))
+    }
+
+    #[test]
+    fn wire_ids_should_be_unique() {
+        let interface = Interface::new();
+        let mut ids = Vec::new();
+        for _ in 0..1000 {
+            let id = interface.get_id();
+            assert!(!ids.contains(&id));
+            ids.push(id);
+        }
+    }
+    #[test]
+    fn call_buffers_should_be_distinct() {
+        let interface = Box::leak(Box::new(Interface::new()));
+        let buf_1 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 0));
+        let buf_2 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 1));
+        let buf_3 = std::thread::spawn(|| interface.get_call_buffer(0, 1, 0));
+        let buf_4 = std::thread::spawn(|| interface.get_call_buffer(1, 0, 0));
+
+        assert!(!has_duplicates(&[
+            buf_1.join().unwrap(),
+            buf_2.join().unwrap(),
+            buf_3.join().unwrap(),
+            buf_4.join().unwrap(),
+        ]));
+    }
+    #[test]
+    fn call_buffers_should_be_reused() {
+        let interface = Box::leak(Box::new(Interface::new()));
+        let buf_1 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 0));
+        let buf_2 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 1));
+        let buf_3 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 0));
+        let buf_4 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 1));
+
+        let buf_1 = buf_1.join().unwrap();
+        let buf_2 = buf_2.join().unwrap();
+        let buf_3 = buf_3.join().unwrap();
+        let buf_4 = buf_4.join().unwrap();
+
+        assert!(has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
+        assert!(buf_1 == buf_3 && buf_2 == buf_4);
+    }
+    #[test]
+    fn message_buf_allocs_should_not_overlap() {
+        let interface = Box::leak(Box::new(Interface::new()));
+        let buf_1 = std::thread::spawn(|| interface.push());
+        let buf_2 = std::thread::spawn(|| interface.push());
+        let buf_3 = std::thread::spawn(|| interface.push());
+        let buf_4 = std::thread::spawn(|| interface.push());
+
+        let buf_1 = buf_1.join().unwrap();
+        let buf_2 = buf_2.join().unwrap();
+        let buf_3 = buf_3.join().unwrap();
+        let buf_4 = buf_4.join().unwrap();
+
+        assert!(!has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
+    }
+    #[test]
+    fn writing_to_msg_until_end_should_work() {
+        let interface = Interface::new();
+        assert!(interface.send(0, 0).is_ok());
+        assert!(interface.send(1, 0).is_ok());
+        assert!(interface.send(2, 0).is_ok());
+        assert!(interface.send(-1, 0).is_ok());
+
+        assert!(interface.send(0, 0).is_err());
+        assert!(interface.send(-1, 0).is_err());
+    }
+    #[test]
+    fn send_many_should_never_terminate() {
+        let interface = Interface::new();
+        assert!(interface.send_many(&[0, 0, 1, 3, 2, 5, 12], 0).is_ok());
+        assert!(interface.send_many(&[0, 8, 1, 3], 0).is_ok());
+        assert!(interface.terminate_message(0).is_ok());
+
+        assert!(interface.send_many(&[1, 4, 3], 0).is_err());
+    }
+    #[test]
+    fn send_to_late_buf_should_fail() {
+        let interface = Interface::new();
+        // No buffers allocated, but 0 should work (next-in-line)
+        assert!(interface.send(0, 0).is_ok());
+        // Now 1 is next
+        assert!(interface.send(0, 1).is_ok());
+        // Now 2 is next, so 3 shouldn't work
+        assert!(interface.send(0, 3).is_err());
+    }
+    #[test]
+    fn get_should_work() {
+        let interface = Interface::new();
+        interface.send(42, 0).unwrap();
+        interface.terminate_message(0).unwrap();
+
+        // This implicitly tests `.get_raw()` as well
+        let msg = interface.get::<u8>(0);
+        assert!(msg.is_ok());
+        assert_eq!(msg.unwrap(), 42);
+    }
+    #[test]
+    fn get_with_wrong_type_should_fail() {
+        let interface = Interface::new();
+        interface.send(42, 0).unwrap();
+        interface.terminate_message(0).unwrap();
+
+        let msg = interface.get::<String>(0);
+        assert!(msg.is_err());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn concurrent_get_should_resolve() {
+        let interface = Box::leak(Box::new(Interface::new()));
+
+        let msg = std::thread::spawn(|| {
+            // Note that this message does not even exist yet
+            interface.get::<String>(1)
+        });
+        assert!(!msg.is_finished());
+        // We can terminate before creation (zero-sized)
+        interface.terminate_message(0).unwrap();
+        interface
+            .send_many(&rmp_serde::encode::to_vec("Hello, world!").unwrap(), 1)
+            .unwrap();
+        // We haven't terminated it yet
+        assert!(!msg.is_finished());
+        interface.terminate_message(1).unwrap();
+
+        let msg = msg.join().unwrap().unwrap();
+        assert_eq!(msg, "Hello, world!");
     }
 }
