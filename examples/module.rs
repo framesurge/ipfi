@@ -1,13 +1,13 @@
-use ipfi::{BufferWire, Interface, Wire};
+use ipfi::{Interface, Wire};
 use once_cell::sync::Lazy;
 
 /// The interface we hold with the host. This will be initialized when the program starts.
 static INTERFACE: Lazy<Interface> = Lazy::new(|| Interface::new());
 
 fn main() {
-    let reader = || {
-        let mut read_wire = BufferWire::from_stdio_read_only(&INTERFACE);
-        while read_wire.receive_one().is_ok() {}
+    let wire = Wire::new(&INTERFACE);
+    let reader = move || {
+        while wire.receive_one(&mut std::io::stdin()).is_ok() {}
     };
     // On Wasm, we have no threads, so we're forced to read all messages at once (we
     // could read a specified number at a time, or we could read until EOF, which is why
@@ -18,8 +18,6 @@ fn main() {
     // all that stdin handle funny business
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(reader);
-
-    let mut write_wire = BufferWire::from_stdio_write_only(&INTERFACE);
 
     // We expect a few messages from the host: this code will block until the above thread has
     // read each of them into the interface (which is thread-safe)
@@ -47,8 +45,8 @@ fn main() {
         t2.join().unwrap();
     }
 
-    // And write a response to the host (remember that the message indices are separated for read and write)
-    write_wire
-        .send_full_message(&"Thanks very much!".to_string(), 0)
-        .unwrap();
+    // // And write a response to the host (remember that the message indices are separated for read and write)
+    // write_wire
+    //     .send_full_message(&"Thanks very much!".to_string(), 0)
+    //     .unwrap();
 }

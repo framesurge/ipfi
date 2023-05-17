@@ -1,4 +1,4 @@
-use ipfi::{BufferWire, Interface, Wire};
+use ipfi::{Interface, Wire};
 use once_cell::sync::Lazy;
 use std::process::{Command, Stdio};
 
@@ -26,41 +26,62 @@ fn main() {
         .stderr(Stdio::inherit())
         .spawn()
         .expect("failed to spawn module");
-    // Move into a new scope, where we'll create the wire from mutable borrows of the child's stdio,
-    // which we have to drop before we can wait on it
-    {
-        {
-            // Instantiate a buffer wire to communicate with the child over its stdio
-            //
-            // You could create a read/write buffer that would also work, but we want to
-            // be able to explicitly drop the stdin, so we have to do it this way
-            let mut child_wire_w =
-                BufferWire::new_write_only(child.stdin.as_mut().unwrap(), &INTERFACE);
 
-            // Send some messages, waiting in between to show how the child will block waiting where it wants to
-            child_wire_w
-                .send_full_message(&"John".to_string(), 0)
-                .unwrap();
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            child_wire_w
-                .send_full_message(&"Doe".to_string(), 1)
-                .unwrap();
-        }
+    // The interface is the core communication type, but the wire is what establishes the actual link between
+    // the module and the host
+    let wire = Wire::new(&INTERFACE);
+    let child_stdin = child.stdin.as_mut().unwrap();
+    // // This is only available on multi-threaded targets, and will start new threads to read and write messages
+    // // while preventing interleaving (i.e. messages getting mixed up with each other). On single-threaded
+    // // platforms, you should call `.flush()` to write messages and `.fill()` to read new messages.
+    // wire.open();
 
-        // Drop the stdin, letting the module know we're done sending messages (only necessary
-        // if you're not using a separate reader thread, and reading all messages at once,
-        // as you would in Wasm)
-        let _ = child.stdin.take();
+    // IPFI is based on message buffers, which can be written to arbitrariyl for as long as you like. Here,
+    // we're writing to two separate buffers, and we're writing the entire message at once, which means we'll
+    // write and then close the buffer. Once a buffer has been closed, no more data can be written to it.
+    // Internally, our interface will retain nothing about these messages after it has written them.
+    wire.send_full_message(&"John".to_string(), 0).unwrap();
+    // That message will now be in a queue and will be sent autonomously, so let's wait a moment for this
+    // next one to show how the module will block.
+    // std::thread::sleep(std::time::Duration::from_secs(1));
+    wire.send_full_message(&"Doe".to_string(), 1).unwrap();
+    wire.flush(child_stdin).unwrap();
 
-        let mut child_wire_r =
-            BufferWire::new_read_only(child.stdout.as_mut().unwrap(), &INTERFACE);
-        // We expect a response from the child now, so wait until its finished sending messages to us (through its stdout)
-        while child_wire_r.receive_one().is_ok() {}
+    // // Move into a new scope, where we'll create the wire from mutable borrows of the child's stdio,
+    // // which we have to drop before we can wait on it
+    // {
+    //     {
+    //         // Instantiate a buffer wire to communicate with the child over its stdio
+    //         //
+    //         // You could create a read/write buffer that would also work, but we want to
+    //         // be able to explicitly drop the stdin, so we have to do it this way
+    //         let mut child_wire_w =
+    //             BufferWire::new_write_only(child.stdin.as_mut().unwrap(), &INTERFACE);
 
-        // We can then fetch what should be the child's first message to us from the interface
-        let response: String = INTERFACE.get(0).unwrap();
-        eprintln!("(From module:) {}", response);
-    }
+    //         // Send some messages, waiting in between to show how the child will block waiting where it wants to
+    //         child_wire_w
+    //             .send_full_message(&"John".to_string(), 0)
+    //             .unwrap();
+    //         std::thread::sleep(std::time::Duration::from_secs(1));
+    //         child_wire_w
+    //             .send_full_message(&"Doe".to_string(), 1)
+    //             .unwrap();
+    //     }
+
+    //     // Drop the stdin, letting the module know we're done sending messages (only necessary
+    //     // if you're not using a separate reader thread, and reading all messages at once,
+    //     // as you would in Wasm)
+    //     let _ = child.stdin.take();
+
+    //     let mut child_wire_r =
+    //         BufferWire::new_read_only(child.stdout.as_mut().unwrap(), &INTERFACE);
+    //     // We expect a response from the child now, so wait until its finished sending messages to us (through its stdout)
+    //     while child_wire_r.receive_one().is_ok() {}
+
+    //     // We can then fetch what should be the child's first message to us from the interface
+    //     let response: String = INTERFACE.get(0).unwrap();
+    //     eprintln!("(From module:) {}", response);
+    // }
 
     let _ = child.wait();
 }

@@ -1,7 +1,7 @@
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{interface::Interface, procedure_args::ProcedureArgs, error::Error};
-use std::{io::{self, Read, Write}, sync::{Arc, Mutex, MutexGuard}, collections::HashMap};
+use std::{io::{self, Read, Write}, sync::{Arc, Mutex}, collections::HashMap};
 
 /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
 ///
@@ -31,6 +31,8 @@ use std::{io::{self, Read, Write}, sync::{Arc, Mutex, MutexGuard}, collections::
 /// if you want to send a few complete arguments at a time, you can use the partial methods that let you provide something implementing [`ProcedureArgs`],
 /// a trait that will perform the underlying serialization for you.
 pub struct Wire<'a> {
+    /// The unique identifier the attached interface has assigned to this wire.
+    id: usize,
     /// The interface to interact with.
     interface: &'a Interface,
     /// An internal message queue, used for preventing interleaved writing, where part of one message is sent, and then part of another, due
@@ -42,12 +44,11 @@ pub struct Wire<'a> {
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed.
     response_idx_map: Arc<Mutex<HashMap<(usize, usize), usize>>>,
 }
-// TODO In interface map of call indices to message buffer indices, we need to also include a unique identifier of the wire who placed the
-// call index, since one interface can be used to receive messages from many clients
 impl<'a> Wire<'a> {
     /// Creates a new buffer-based wire to work with the given interface.
     pub fn new(interface: &'a Interface) -> Self {
         Self {
+            id: interface.get_id(),
             interface,
             queue: Arc::new(Mutex::new(Vec::new())),
             remote_call_counter: Arc::new(Mutex::new(HashMap::new())),
@@ -104,7 +105,7 @@ impl<'a> Wire<'a> {
 
         let mut rcc = self.remote_call_counter.lock().unwrap();
         // Create a new entry in the remote call counter for this call index
-        let call_idx = if let Some(mut last_call_idx) = rcc.get(&procedure_idx).as_mut() {
+        let call_idx = if let Some(last_call_idx) = rcc.get(&procedure_idx).as_mut() {
             // We need to update what's in there
             let new_call_idx = *last_call_idx + 1;
             *last_call_idx = &new_call_idx;
@@ -119,7 +120,7 @@ impl<'a> Wire<'a> {
         // Add that to the remote index map so we can retrieve it for later continutation and termination
         // of this call
         {
-            let rim = self.response_idx_map.lock().unwrap();
+            let mut rim = self.response_idx_map.lock().unwrap();
             rim.insert((procedure_idx, call_idx), response_idx);
         }
 
@@ -215,56 +216,141 @@ impl<'a> Wire<'a> {
     /// interface the other side maintains (it has no relation to our own interface!).
     ///
     /// This will not send a termination signal.
-    fn send_bytes(&mut self, bytes: &[u8], message_idx: usize) -> Result<(), io::Error> {
-        // IPFI expects the message index first as a `u32`, expressed here as an array
-        // of four `u8`s, in little endian order
-        let message_idx = (message_idx as u32).to_le_bytes();
-        self.output.write_all(&message_idx)?;
-
-        // Then we send the number of bytes to expect next
-        let num_bytes = bytes.len() as u32;
-        let num_bytes = num_bytes.to_le_bytes();
-        self.output.write_all(&num_bytes)?;
-
-        // And finally send the actual bytes
-        self.output.write_all(&bytes)?;
+    pub fn send_bytes(&self, bytes: &[u8], message_idx: usize) -> Result<(), Error> {
+        let msg = Message::General {
+            message_idx,
+            message: bytes,
+        };
+        let bytes = msg.to_bytes()?;
+        self.queue.lock().unwrap().push(bytes);
 
         Ok(())
+    }
+    /// Sends the given full message over the wire to the given remote message buffer index.
+    pub fn send_full_message<T: Serialize>(&self, msg: &T, message_idx: usize) -> Result<(), Error> {
+        let bytes = rmp_serde::to_vec(msg)?;
+        self.send_bytes(&bytes, message_idx)?;
+        self.end_message(message_idx)
     }
     /// Sends a termination signal over the wire for the given message index. After this is called, further bytes will
     /// not be able to be sent for this message.
-    fn end_message(&mut self, message_idx: usize) -> Result<(), io::Error> {
-        // Message index as usual
-        let message_idx = (message_idx as u32).to_le_bytes();
-        self.output.write_all(&message_idx)?;
-
-        // Then a length of zero
-        self.output.write_all(&[0u8; 4])?;
+    pub fn end_message(&self, message_idx: usize) -> Result<(), Error> {
+        let msg = Message::General {
+            message_idx,
+            message: &[],
+        };
+        let bytes = msg.to_bytes()?;
+        self.queue.lock().unwrap().push(bytes);
 
         Ok(())
     }
-    fn receive_one(&mut self) -> Result<(), io::Error> {
-        // First is the message index
-        let mut idx_buf = [0u8; 4];
-        self.input.read_exact(&mut idx_buf)?;
-        let message_idx = u32::from_le_bytes(idx_buf) as usize;
+    /// Receives a single message from the given reader, sending it into the interface as appropriate. This contains
+    /// the core logic that handles messages, partial procedure calls, etc.
+    ///
+    /// If a procedure call is completed in this read, this method will automatically block waiting for the response,
+    /// and it will followingly add said response to the internal writer queue.
+    pub fn receive_one(&self, reader: &mut impl Read) -> Result<(), Error> {
+        // First is the type of message
+        let mut ty_buf = [0u8];
+        reader.read_exact(&mut ty_buf)?;
+        let ty = u8::from_le_bytes(ty_buf);
+        match ty {
+            // Procedure call
+            1 => {
+                // First is the procedure index
+                let mut procedure_buf = [0u8; 4];
+                reader.read_exact(&mut procedure_buf)?;
+                let procedure_idx = u32::from_le_bytes(procedure_buf) as usize;
 
-        // Then the number of bytes to expect
-        let mut len_buf = [0u8; 4];
-        self.input.read_exact(&mut len_buf)?;
-        let num_bytes = u32::from_le_bytes(len_buf) as usize;
+                // Second is the call index
+                let mut call_buf = [0u8; 4];
+                reader.read_exact(&mut call_buf)?;
+                let call_idx = u32::from_le_bytes(call_buf) as usize;
 
-        // If that's zero, we should end the message
-        if num_bytes == 0 {
-            self.interface.terminate_message(message_idx);
-        } else {
-            let mut bytes = vec![0u8; num_bytes];
-            self.input.read_exact(&mut bytes)?;
+                // Third is the message index *on the caller* we'll send the response to
+                let mut response_buf = [0u8; 4];
+                reader.read_exact(&mut response_buf)?;
+                let response_idx = u32::from_le_bytes(response_buf) as usize;
 
-            self.interface.send_many(&bytes, message_idx);
+                // Then the number of bytes to expect
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf)?;
+                let num_bytes = u32::from_le_bytes(len_buf) as usize;
+
+                // We need to know where to put argument information
+                let call_buf_idx = self.interface.get_call_buffer(procedure_idx, call_idx, self.id);
+
+                // If there were no arguments, we should call the procedure (we either allegedly have everything, or
+                // the procedure takes no arguments in the first place)
+                if num_bytes == 0 {
+                    self.interface.terminate_message(call_buf_idx)?;
+
+                    // This will actually execute!
+                    let ret = self.interface.call_procedure(procedure_idx, call_buf_idx)?;
+                    let ret_msg = Message::General {
+                        message_idx: response_idx,
+                        message: &ret
+                    };
+                    let ret_msg_bytes = ret_msg.to_bytes()?;
+                    self.queue.lock().unwrap().push(ret_msg_bytes)
+                } else {
+                    // We're continuing or starting a new partial procedure argument addition, so get a local message
+                    // buffer for it if there isn't already one
+
+                    let mut bytes = vec![0u8; num_bytes];
+                    reader.read_exact(&mut bytes)?;
+
+                    // This will accumulate argument bytes over potentially many continuations in the local call buffer
+                    self.interface.send_many(&bytes, call_buf_idx)?;
+                }
+            },
+            // General message
+            2 => {
+                // First is the message index
+                let mut idx_buf = [0u8; 4];
+                reader.read_exact(&mut idx_buf)?;
+                let message_idx = u32::from_le_bytes(idx_buf) as usize;
+
+                // Then the number of bytes to expect
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf)?;
+                let num_bytes = u32::from_le_bytes(len_buf) as usize;
+
+                // If that's zero, we should end the message
+                if num_bytes == 0 {
+                    self.interface.terminate_message(message_idx)?;
+                } else {
+                    let mut bytes = vec![0u8; num_bytes];
+                    reader.read_exact(&mut bytes)?;
+
+                    self.interface.send_many(&bytes, message_idx)?;
+                }
+            },
+            // Termination: the other program is shutting down and is no longer capable of receiving messages
+            // This is the IPFI equivalent of 'expected EOF'
+            0 => {
+                todo!()
+            },
+            // Unknown message types will be ignored
+            _ => {}
         }
 
         Ok(())
+    }
+
+    /// Writes all messages currently in the internal write queue to the given output stream.
+    pub fn flush(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
+        // This will remove the written messages from the queue
+        for msg_bytes in self.queue.lock().unwrap().drain(..) {
+            writer.write_all(&msg_bytes)?;
+        }
+        writer.flush()?;
+
+        Ok(())
+    }
+    // TODO
+    pub fn fill(&self) -> Result<(), std::io::Error> {
+        todo!()
     }
 }
 
@@ -328,6 +414,9 @@ impl<'b> Message<'b> {
         let mut buf = Vec::new();
 
         match &self {
+            Self::Termination => {
+                buf.write_all(&[0])?;
+            },
             Self::Call { procedure_idx, call_idx, response_idx, args } => {
                 buf.write_all(&[1])?;
                 // Step 1
@@ -335,17 +424,17 @@ impl<'b> Message<'b> {
                 buf.write_all(&procedure_idx)?;
                 // Step 2
                 let call_idx = (*call_idx as u32).to_le_bytes();
-                buf.write_all(&call_idx);
+                buf.write_all(&call_idx)?;
                 // Step 3
                 let response_idx = (*response_idx as u32).to_le_bytes();
-                buf.write_all(&response_idx);
+                buf.write_all(&response_idx)?;
                 // Step 4
                 let num_bytes = args.len() as u32;
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
                 // Step 5 (only bother if we're not terminating)
                 if args.len() > 0 {
-                    buf.write_all(args);
+                    buf.write_all(args)?;
                 }
             },
             Self::General { message_idx, message } => {
@@ -374,7 +463,7 @@ impl<'b> Message<'b> {
 ///
 /// Typically, this will be called in the cleanup of module processes spawned by some host, and stdout will be the
 /// chosen buf.
-pub fn signal_termination(writer: impl Write) -> Result<(), std::io::Error> {
+pub fn signal_termination(writer: &mut impl Write) -> Result<(), std::io::Error> {
     writer.write_all(&[0])?;
     writer.flush()?;
 

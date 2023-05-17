@@ -27,10 +27,6 @@ impl<T: Serialize + DeserializeOwned, const N: usize> ProcedureArgs for [T; N] {
         for elem in self {
             data.extend(rmp_serde::to_vec(&elem)?);
         }
-        // let mut vec = Vec::new();
-        // // This lets us reinterpret as a tuple later in deserialization
-        // rmp::encode::write_array_len(&mut vec, self.len() as u32);
-        // vec.extend(data);
 
         Ok(data)
     }
@@ -42,9 +38,10 @@ macro_rules! impl_args {
         impl<$($p: Serialize + DeserializeOwned),*> ProcedureArgs for ($($p,)*)
         {
             #[inline]
-            #[allow(unused_variables)]
             fn into_bytes(self) -> Result<Vec<u8>, Error> {
+                #[allow(non_snake_case)]
                 let ($($p,)*) = self;
+                #[allow(unused_mut)]
                 let mut data: Vec<u8> = Vec::new();
                 $(data.extend(rmp_serde::to_vec(&$p)?);)*
 
@@ -65,3 +62,40 @@ macro_rules! impl_args {
 }
 
 impl_args!(A, B, C, D, E, F, G, H, J, K, L, M, N, P, Q, R, S, T, U, V);
+
+/// An internal trait used to get the lengths of tuples. This is needed so we can insert the correct
+/// MessagePack length marker when we deserialize the arguments provied piecemeal over an interface.
+pub trait Tuple {
+    fn len() -> usize;
+}
+macro_rules! impl_tuple {
+    ($($p:ident),*) => {
+        impl<$($p: Serialize + DeserializeOwned),*> Tuple for ($($p,)*)
+        {
+            #[inline]
+            fn len() -> usize {
+                #[allow(unused_mut)]
+                let mut counter = 0;
+                $(
+                    nothing::<$p>();
+                    counter += 1;
+                )*
+                counter
+            }
+        }
+
+        impl_tuple!(@pop $($p),*);
+    };
+    (@pop) => {
+    };
+    (@pop $head:ident) => {
+        impl_tuple!();
+    };
+    (@pop $head:ident $(, $tail:ident)+) => {
+        impl_tuple!($($tail),*);
+    };
+}
+impl_tuple!(A, B, C, D, E, F, G, H, J, K, L, M, N, P, Q, R, S, T, U, V);
+
+// Used to keep track of type parameters in macro expansions
+fn nothing<T>() {}

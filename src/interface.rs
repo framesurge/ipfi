@@ -1,15 +1,18 @@
-use crate::{complete_lock::CompleteLock, error::Error};
+use crate::{complete_lock::CompleteLock, error::Error, procedure_args::Tuple};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Mutex},
 };
 
 /// A procedure registered on an interface.
 pub struct Procedure {
     /// The closure that will be called, which uses pure bytes as an interface. If there is a failure to
     /// deserialize the arguments or serialize the return type, an error will be returned.
-    closure: Box<dyn Fn(Vec<u8>) -> Result<Vec<u8>, Error> + Send + Sync + 'static>,
+    ///
+    /// The bytes this takes for its arguments will *not* have a MessagePack length marker set at the front,
+    /// and that will be added internally at deserialization.
+    closure: Box<dyn Fn(&[u8]) -> Result<Vec<u8>, Error> + Send + Sync + 'static>,
 }
 
 /// An inter-process communication (IPC) interface based on the arbitrary reception of bytes.
@@ -34,15 +37,40 @@ pub struct Interface {
     /// A list of procedures registered on this interface that those communicating with this
     /// program may execute.
     procedures: Arc<RwLock<HashMap<usize, Procedure>>>,
+    /// A map of procedure call indices and the wire IDs that produced them to local message buffer addresses.
+    /// These are necessary because, when a program sends a partial procedure call, and then later completes it,
+    /// we need to know that the two messages are part of the same call. On their side, the caller will maintain
+    /// a list of call indices, which we map here to local message buffers, allowing us to continue filling them
+    /// as necessary.
+    ///
+    /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
+    call_to_buffer_map: Arc<Mutex<HashMap<(usize, usize, usize), usize>>>,
+    /// The unique numerical identifier that will be used for the next wire that connects to this interface.
+    /// We map call indices to message buffers, but, since one interface can be used to connect to many wires,
+    /// call indices are likely to overlap, so every wire must have a unique identifier. Instead of pulling
+    /// in `uuid` or a similar crate, we manage these identifiers manually.
+    next_wire_id: Mutex<usize>,
 }
 impl Interface {
-    /// Initializes a new interface with some other host module.
+    /// Initializes a new interface to be used for connecting to as many other programs as necessary through wires,
+    /// or through manual communication management.
     pub fn new() -> Self {
         Self {
             messages: Arc::new(RwLock::new(Vec::new())),
             creation_locks: Arc::new(RwLock::new(HashMap::new())),
             procedures: Arc::new(RwLock::new(HashMap::new())),
+            call_to_buffer_map: Arc::new(Mutex::new(HashMap::new())),
+            next_wire_id: Mutex::new(0),
         }
+    }
+    /// Gets an ID for a wire or other communication primitive that will depend on this interface. Any IPC primitive
+    /// that will call procedures should acquire one of these for itself to make sure its procedure calls do not overlap
+    /// with those of other wires. Typically, this will be called internally by the [`crate::Wire`] type.
+    pub fn get_id(&self) -> usize {
+        let mut next_next_wire_id = self.next_wire_id.lock().unwrap();
+        let next_wire_id = *next_next_wire_id;
+        *next_next_wire_id += 1;
+        next_wire_id
     }
     /// Adds the given function as a procedure on this interface, which will allow other programs interacting with
     /// this one to execute it. Critically, no validation of intent or origin is requires to remotely execute procedures
@@ -59,8 +87,14 @@ impl Interface {
     /// within the procedure itself, otherwise any program could use IPFI to pass invalid integers. Alternately, you can use a custom
     /// serialization/deserialization process to uphold invariants, provided you are satisfied that is secure against totally untrusted
     /// input.
-    pub fn add_procedure<A: Serialize + DeserializeOwned, R: Serialize + DeserializeOwned>(&self, idx: usize, f: impl Fn(A) -> R + Send + Sync + 'static) {
-        let closure = Box::new(move |bytes: Vec<u8>| {
+    pub fn add_procedure<A: Serialize + DeserializeOwned + Tuple, R: Serialize + DeserializeOwned>(&self, idx: usize, f: impl Fn(A) -> R + Send + Sync + 'static) {
+        let closure = Box::new(move |data: &[u8]| {
+            // Add the correct length prefix so this can be deserialized as the tuple it is (this is what allows
+            // piecemeal argument transmission)
+            let mut bytes = Vec::new();
+            rmp::encode::write_array_len(&mut bytes, A::len() as u32).map_err(|_| Error::WriteLenMarkerFailed)?;
+            bytes.extend(data);
+
             let arg_tuple = rmp_serde::decode::from_slice(&bytes)?;
             let ret = f(arg_tuple);
             let ret = rmp_serde::encode::to_vec(&ret)?;
@@ -72,18 +106,44 @@ impl Interface {
         };
         self.procedures.write().unwrap().insert(idx, procedure);
     }
-    /// Calls the procedure with the given index, returning the raw serialized byte vector it produces, or `None` if a procedure with
-    /// the given index has not been registered. This takes ownership of the byte arguments provided to the function, for internal
-    /// lifetime reasons.
+    /// Calls the procedure with the given index, returning the raw serialized byte vector it produces. This will get its
+    /// argument information from the given internal message buffer index, which it expects to be completed. This method
+    /// will not block waiting for a completion (or creation) of that buffer.
     ///
     /// There is no method provided to avoid byte serialization, because procedure calls over IPFI are intended to be made solely by
     /// remote communicators.
-    pub fn call_procedure(&self, idx: usize, args: Vec<u8>) -> Option<Result<Vec<u8>, Error>> {
-        if let Some(procedure) = self.procedures.read().unwrap().get(&idx) {
-            Some((procedure.closure)(args))
+    pub fn call_procedure(&self, procedure_idx: usize, args_buf_idx: usize) -> Result<Vec<u8>, Error> {
+        if let Some(procedure) = self.procedures.read().unwrap().get(&procedure_idx) {
+            let messages = self.messages.read().unwrap();
+            if let Some((args, complete_lock)) = messages.get(args_buf_idx) {
+                if complete_lock.completed() {
+                    // The length marker will be inserted by the internal wrapper closure
+                    (procedure.closure)(args)
+                } else {
+                    Err(Error::CallBufferIncomplete { index: args_buf_idx })
+                }
+            } else {
+                Err(Error::NoCallBuffer { index: args_buf_idx })
+            }
         } else {
-            None
+            Err(Error::NoSuchProcedure { index: procedure_idx })
         }
+    }
+    /// Gets the index of a local message buffer to be used to store the given call of the given procedure from the given wire.
+    /// This allows arguments to be accumulated piecemeal before the actual procedure call.
+    ///
+    /// This will create a buffer for this call if one doesn't already exist, and otherwise it will create one.
+    pub fn get_call_buffer(&self, procedure_idx: usize, call_idx: usize, wire_id: usize) -> usize {
+        let mut map = self.call_to_buffer_map.lock().unwrap();
+        let buf_idx = if let Some(buf_idx) = map.get(&(procedure_idx, call_idx, wire_id)) {
+            *buf_idx
+        } else {
+            let new_idx = self.push();
+            map.insert((procedure_idx, call_idx, wire_id), new_idx);
+            new_idx
+        };
+
+        buf_idx
     }
     /// Allocates space for a new message buffer, creating a new completion lock.
     /// This will also mark a relevant creation lock as completed if one exists.

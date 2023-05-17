@@ -23,5 +23,20 @@ pub enum Error {
     #[error("attempted to send zero-length payload in non-terminating function (sending zero-length payloads would be interpreted by IPFI as a message termination directive)")]
     ZeroLengthInNonTerminating,
     #[error(transparent)]
-    IoError(#[from] std::io::Error)
+    IoError(#[from] std::io::Error),
+    #[error("no procedure has been registered with index {index}")]
+    NoSuchProcedure {
+        index: usize,
+    },
+    #[error("no local message buffer exists with index {index} for provided procedure call (attempted to call procedure before argument preparation)")]
+    NoCallBuffer {
+        index: usize,
+    },
+    #[error("procedure call buffer with index {index} is incomplete (attempted to call procedure before argument reception was complete)")]
+    CallBufferIncomplete {
+        index: usize,
+    },
+    // This should basically never occur
+    #[error("couldn't write length marker for accumulated arguments (likely spontaneous failure)")]
+    WriteLenMarkerFailed
 }
