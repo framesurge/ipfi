@@ -51,6 +51,15 @@ fn main() {
     wire.send_full_message(&"Doe".to_string(), 1).unwrap();
 
     let greeting_handle = wire.call(0, ()).unwrap();
+
+    // If we're deaing with a single-threaded remote program that reads all its input at once, we have to tell it
+    // when we're done, which would require either dropping `child.stdin` here (impossible because the wire has
+    // taken ownership) or or sending some kind of manual EOF-like signal. This is the latter, and can be used
+    // to manually break out of read loops on the client-side. See the method docs for further details.
+    if wasm {
+        wire.signal_end_of_input().unwrap();
+    }
+
     let _: () = greeting_handle.wait().unwrap();
 
     // Now we're using that buffer we pre-allocated earlier

@@ -133,8 +133,14 @@ impl Interface {
     pub fn call_procedure(
         &self,
         procedure_idx: usize,
-        args_buf_idx: usize,
+        call_idx: usize,
+        wire_id: usize,
     ) -> Result<Vec<u8>, Error> {
+        // Get the buffer where the arguments are supposed to be, and then delete that mapping to free up some space
+        let args_buf_idx = self.get_call_buffer(procedure_idx, call_idx, wire_id);
+        let mut map = self.call_to_buffer_map.lock().unwrap();
+        map.remove(&(procedure_idx, call_idx, wire_id));
+
         if let Some(procedure) = self.procedures.read().unwrap().get(&procedure_idx) {
             let messages = self.messages.read().unwrap();
             if let Some((args, complete_lock)) = messages.get(args_buf_idx) {
@@ -290,6 +296,10 @@ impl Interface {
     /// Gets an object of the given type from the given message buffer index of the interface. This will block
     /// waiting for the given message buffer to be (1) created and (2) marked as complete. Depending on the
     /// caller's behaviour, this may block forever if they never complete the message.
+    ///
+    /// Note that this method will extract the underlying message from the given buffer index, leaving it
+    /// available for future messages or procedure call metadata. This means that requesting the same message
+    /// index may yield completely different data.
     pub fn get<T: DeserializeOwned>(&self, message: usize) -> Result<T, Error> {
         let message = self.get_raw(message);
         let decoded = rmp_serde::decode::from_slice(&message)?;
@@ -299,7 +309,11 @@ impl Interface {
     /// them outside the thread-lock.
     ///
     /// This will block until the message with the given index has been created and completed.
-    fn get_raw(&self, message_idx: usize) -> Vec<u8> {
+    ///
+    /// Note that this method will extract the underlying message from the given buffer index, leaving it
+    /// available for future messages or procedure call metadata. This means that requesting the same message
+    /// index may yield completely different data.
+    pub fn get_raw(&self, message_idx: usize) -> Vec<u8> {
         // We need two completion locks to be ready before we're ready: the first is
         // a creation lock on the message index, and the second is a lock on its
         // actual completion. We'll start by creating a new completion lock if one
@@ -328,6 +342,12 @@ impl Interface {
                 };
 
                 lock.wait_for_completion();
+                // Now delete that lock to free up some space
+                // Note that our read-only creation locks instance will definitely have been dropped
+                // by this point
+                let mut creation_locks_w = self.creation_locks.write().unwrap();
+                creation_locks_w.remove(&message_idx);
+
                 messages = self.messages.read().unwrap();
                 messages.get(message_idx).unwrap()
             };

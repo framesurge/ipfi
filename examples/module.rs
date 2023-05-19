@@ -31,7 +31,6 @@ fn main() {
     // And write a response to the host (remember that the message indices are separated for read and write)
     wire.send_full_message(&"Thanks very much!".to_string(), 0)
         .unwrap();
-    wire.flush(&mut std::io::stdout()).unwrap();
 }
 
 // Wasm, we have no threads
@@ -40,8 +39,8 @@ fn main() {
     INTERFACE.add_procedure(0, print_hello);
 
     let wire = Wire::new(&INTERFACE);
-    // We have no threads, so we'll have to read all the messages now
-    while wire.fill(&mut std::io::stdin()).is_ok() {}
+    // We have no threads, so we'll read until the host sends end-of-input
+    wire.fill(&mut std::io::stdin()).unwrap();
 
     // We have to read these sequentially in Wasm, hoping the above has gotten the messages to back them,
     // otherwise this would hang forever

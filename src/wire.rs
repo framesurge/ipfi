@@ -122,18 +122,6 @@ impl<'a> Wire<'a> {
         // minimising the time between termination and notification through mass operation failure
         *self.terminated.read().unwrap()
     }
-    // /// Creates a new buffer-based wire from the given interface, using stdin as an input and stdout as an output. Generally,
-    // /// this should be used by modules executed as child processes by the hosts they want to communicate with.
-    // ///
-    // /// **WARNING:** This will lock both stdin and stdout, preventing any other operations from using them until this
-    // /// wire is dropped! After calling this, make sure to output any logs or the like to stderr, or your application will
-    // /// hang.
-    // pub fn from_stdio(interface: &'a Interface) -> Self {
-    //     let stdin = std::io::stdin().lock();
-    //     let stdout = std::io::stdout().lock();
-
-    //     Self::new(stdin, stdout, interface)
-    // }
 
     /// Calls the procedure with the given remote procedure index. This will return a handle you can use to block waiting
     /// for the return value of the procedure.
@@ -263,7 +251,16 @@ impl<'a> Wire<'a> {
         self.queue.lock().unwrap().push(bytes);
 
         // And neither does this
-        self.end_given_call(procedure_idx, call_idx)
+        // Only write an explicit termination message if we had arguments though, otherwise that would become
+        // superfluous and we'd get a double-call by accident! This can cause extremely weird behaviour.
+        if !args.is_empty() {
+            self.end_given_call(procedure_idx, call_idx)
+        } else {
+            Ok(CallHandle {
+                response_idx,
+                interface: self.interface,
+            })
+        }
     }
     /// Continues the procedure call with the given remote procedure index and call index by sending the given arguments.
     /// This will not terminate the message, and will leave it open for calling.
@@ -419,9 +416,9 @@ impl<'a> Wire<'a> {
     /// If a procedure call is completed in this read, this method will automatically block waiting for the response,
     /// and it will followingly add said response to the internal writer queue.
     ///
-    /// This returns whether or not it read a message/call termination message (needed internally for `.fill()`). That
-    /// will also return `true` if a wire termination message is received.
-    pub fn receive_one(&self, reader: &mut impl Read) -> Result<bool, Error> {
+    /// This returns whether or not it read a message/call termination message). That will also return `true` if a wire
+    /// termination message is received. Alternately, `None` will be returned if there was a manual end of input message.
+    pub fn receive_one(&self, reader: &mut impl Read) -> Result<Option<bool>, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -464,7 +461,10 @@ impl<'a> Wire<'a> {
                     self.interface.terminate_message(call_buf_idx)?;
 
                     // This will actually execute!
-                    let ret = self.interface.call_procedure(procedure_idx, call_buf_idx)?;
+                    // Note that this will remove the `call_buf_idx` mapping and drain the arguments out of that buffer
+                    let ret = self
+                        .interface
+                        .call_procedure(procedure_idx, call_idx, self.id)?;
                     let ret_msg = Message::General {
                         message_idx: response_idx,
                         message: &ret,
@@ -480,7 +480,7 @@ impl<'a> Wire<'a> {
                         }
                         .to_bytes()?,
                     );
-                    Ok(true)
+                    Ok(Some(true))
                 } else {
                     // We're continuing or starting a new partial procedure argument addition, so get a local message
                     // buffer for it if there isn't already one
@@ -490,7 +490,7 @@ impl<'a> Wire<'a> {
 
                     // This will accumulate argument bytes over potentially many continuations in the local call buffer
                     self.interface.send_many(&bytes, call_buf_idx)?;
-                    Ok(false)
+                    Ok(Some(false))
                 }
             }
             // General message
@@ -508,25 +508,27 @@ impl<'a> Wire<'a> {
                 // If that's zero, we should end the message
                 if num_bytes == 0 {
                     self.interface.terminate_message(message_idx)?;
-                    Ok(true)
+                    Ok(Some(true))
                 } else {
                     let mut bytes = vec![0u8; num_bytes];
                     reader.read_exact(&mut bytes)?;
 
                     self.interface.send_many(&bytes, message_idx)?;
-                    Ok(false)
+                    Ok(Some(false))
                 }
             }
+            // Manual end of input (we should stop whatever called this with a clean error)
+            3 => Ok(None),
             // Termination: the other program is shutting down and is no longer capable of receiving messages
             // This is the IPFI equivalent of 'expected EOF'
             0 => {
                 // This will lead all other operation to fail, potentially in the middle of their work
                 *self.terminated.write().unwrap() = true;
 
-                Ok(true)
+                Ok(Some(true))
             }
             // Unknown message types will be ignored
-            _ => Ok(false),
+            _ => Ok(Some(false)),
         }
     }
 
@@ -544,46 +546,51 @@ impl<'a> Wire<'a> {
 
         Ok(())
     }
-    /// An ergonomic equivalent of `.receive_one()` that receives messages until a termination message is sent. This guarantees only
-    /// that one message will have been fully received, and, since IPFI supports concurrent message transmission, it is entirely possible
-    /// that message A may start, then message B may start, and then message A may end, before message B finally ends. In this case,
-    /// this method would capture the entirety of message A, including termination, but only part of message B. As such, this method
-    /// is generally best used in cases where communication is generally very predictable.
+    /// An ergonomic equivalent of `.receive_one()` that receives messages until either an error occurs, or until the remote program
+    /// sends a manual end-of-input signal (with `.signal_end_of_input()`). This should only be used in single-threaded scenarios
+    /// to read a block of messages, as otherwise this is rendered superfluous by `.open()`, which runs this automatically in a
+    /// loop.
     ///
-    /// This method should almost never be used in multi-threaded situations, and the `.open()` method should definitely be preferred,
-    /// as that mitigates the need to ever manually manage filling and flushing.
+    /// Note that the remote program must *manually* send that end-of-input signal, and when it does this will be dependent on the
+    /// needs of your unique program.
     ///
     /// **WARNING:** This method will internally handle `UnexpectedEof` errors and terminate the wire itself, assuming that the given
     /// buffer is the only means of communication with the other side of the wire. If this is not the case, you should manually call
-    /// `.receive_one()` until it returns `Ok(false)`, to mimic the behaviour of this method. Note that such errors will still be returned,
+    /// `.receive_one()` until it returns `None`, to mimic the behaviour of this method. Note that such errors will still be returned,
     /// after the termination flag has been set.
     pub fn fill(&self, reader: &mut impl Read) -> Result<(), Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
 
-        // Read until a message termination
+        // Read until end-of-input is sent
         loop {
             match self.receive_one(reader) {
-                // We got a full message, so end if it was the end of a message, or continue if there's more to be read
-                Ok(message_ended) => {
-                    if message_ended {
-                        break;
-                    } else {
-                        continue;
-                    }
-                }
+                Ok(None) => break Ok(()),
+                // Some other message, keep reading
+                Ok(_) => continue,
                 // If we run into an unexpected EOF at any time during the `.receive_one()` call, the other side has almost
                 // certainly terminated from that buffer
                 Err(Error::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                     // This  will prevent all further operations on this wire
                     *self.terminated.write().unwrap() = true;
-                    return Err(Error::IoError(err));
+                    break Err(Error::IoError(err));
                 }
                 // Any unexpected errors should be propagated
-                Err(err) => return Err(err),
+                Err(err) => break Err(err),
             }
         }
+    }
+    /// Writes a manual end-of-input signal to the output, which, when flushed (potentially automatically if you've called `wire.start()`),
+    /// will cause any `wire.fill()` calls in the remote program to return `Ok(false)`, which can be checked for termination. This is
+    /// necessary when communicating with single-threaded programs, which must read all their input at once, to tell them to stop reading
+    /// and start doing other work. This does not signal the termination of the wire, or even that there will not be any input in future,
+    /// it simply allows you to signal to the remote that it should start doing something else. Internally, the reception of this case is
+    /// generally not handled, and it is up to you as a user to handle it.
+    pub fn signal_end_of_input(&self) -> Result<(), std::io::Error> {
+        let msg = Message::EndOfInput;
+        let bytes = msg.to_bytes()?;
+        self.queue.lock().unwrap().push(bytes);
 
         Ok(())
     }
@@ -591,7 +598,8 @@ impl<'a> Wire<'a> {
 
 /// A handle for waiting on the return values of remote procedure calls. This is necessary because calling a remote procedure
 /// requires `.flush()` to be called, so waiting inside a function like `.call()` would make very little sense.
-#[derive(Clone)]
+// There is no point in making this `Clone` to avoid issues around dropping the wire, as the `'a` lifetime is what gets in
+// the way
 pub struct CallHandle<'a> {
     /// The message index to wait for. If this is improperly initialised, we will probably get completely different and almost
     /// certainly invalid data.
@@ -649,6 +657,14 @@ enum Message<'b> {
 
         message: &'b [u8],
     },
+    /// A message that indicates that the sender will not send any more data. This is different from termination
+    /// in that it implies that the channel is still open for the sender to receive more data, this merely means
+    /// that the sender will not send anything further. This message is irrevocable, and generally useless, except
+    /// when communicating with a single-threaded program that has to read all its input at once.
+    ///
+    /// It is occasionally useful for such a program to read batches of input, in which case this could be used to
+    /// signify the ends of batches. In essence, its meaning is case-dependent.
+    EndOfInput,
 }
 impl<'b> Message<'b> {
     /// Writes the message in byte form to the given writer, according to the IPFI Binary Format (ipfiBuF).
@@ -727,6 +743,9 @@ impl<'b> Message<'b> {
                 if !message.is_empty() {
                     buf.write_all(message)?;
                 }
+            }
+            Self::EndOfInput => {
+                buf.write_all(&[3])?;
             }
         }
 
