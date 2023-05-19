@@ -3,7 +3,6 @@ use crate::{
 };
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
-use std::sync::RwLock;
 
 // The following are newtype wrappers that can deliberately only be constructed internally to avoid confusion.
 // This also allows us to keep the internals as implementation details, and to change them without a breaking
@@ -51,8 +50,13 @@ pub struct Procedure {
 /// messages. Once a message is accumulated, it will be stored in the buffer until the interface is
 /// dropped.
 pub struct Interface {
-    /// The messages received over the interface.
-    messages: RwLock<Vec<(Vec<u8>, CompleteLock)>>,
+    /// The messages received over the interface. This is implemented as a concurrent hash map indexed by a `usize`,
+    /// which means that, when a message is read, we can remove its entry from the map entirely and its identifier can
+    /// be relinquished into a reuse-or-increment queue.
+    messages: DashMap<usize, (Vec<u8>, CompleteLock)>,
+    /// A queue that produces unique message identifiers while allowing us to recycle old ones. This enables far greater
+    /// memory efficiency.
+    message_id_queue: RoiQueue,
     /// A record of locks used to wait on the existence of a certain message
     /// index. Since multiple threads could simultaneously wait for different message
     /// indices, this has to be implemented this way!
@@ -76,7 +80,8 @@ pub struct Interface {
 impl Default for Interface {
     fn default() -> Self {
         Self {
-            messages: RwLock::new(Vec::new()),
+            messages: DashMap::new(),
+            message_id_queue: RoiQueue::new(),
             creation_locks: DashMap::new(),
             procedures: DashMap::new(),
             call_to_buffer_map: DashMap::new(),
@@ -168,11 +173,18 @@ impl Interface {
             .remove(&(procedure_idx, call_idx, wire_id));
 
         if let Some(procedure) = self.procedures.get(&procedure_idx) {
-            let messages = self.messages.read().unwrap();
-            if let Some((args, complete_lock)) = messages.get(args_buf_idx) {
+            if let Some(m) = self.messages.get(&args_buf_idx) {
+                let (args, complete_lock) = m.value();
                 if complete_lock.completed() {
                     // The length marker will be inserted by the internal wrapper closure
-                    (procedure.closure)(args)
+                    let ret = (procedure.closure)(args);
+                    // Success, relinquish this message buffer
+                    // To do that though, we have to drop anything referencing the map
+                    drop(args);
+                    drop(complete_lock);
+                    drop(m);
+                    self.pop(args_buf_idx);
+                    ret
                 } else {
                     Err(Error::CallBufferIncomplete {
                         index: args_buf_idx,
@@ -219,111 +231,88 @@ impl Interface {
     /// The caller must ensure that both the messages and creation locks are accessible
     /// when this function is called, or a deadlock will ensue.
     pub fn push(&self) -> usize {
-        let mut messages = self.messages.write().unwrap();
-        let new_idx = messages.len();
-        messages.push((Vec::new(), CompleteLock::new()));
+        let new_id = self.message_id_queue.get();
+        self.messages
+            .insert(new_id, (Vec::new(), CompleteLock::new()));
 
         // If anyone was waiting for this buffer to exist, it now does!
-        if let Some(lock) = self.creation_locks.get_mut(&new_idx) {
+        if let Some(lock) = self.creation_locks.get_mut(&new_id) {
             lock.mark_complete();
         }
 
-        new_idx
+        new_id
+    }
+    /// Deletes the given message buffer and relinquishes its unique identifier back into
+    /// the queue for reuse. This must be provided an ID that was previously issued by `.push()`.
+    fn pop(&self, id: usize) -> Option<(Vec<u8>, CompleteLock)> {
+        if let Some((_id, val)) = self.messages.remove(&id) {
+            self.message_id_queue.relinquish(id);
+            Some(val)
+        } else {
+            None
+        }
     }
     /// Sends the given element through to the interface, adding it to the byte array of the message with
     /// the given 32-bit identifier. If `-1` is provided, the message will be marked as completed. This will
     /// return an error if the message was already completed, or out-of-bounds, or otherwise `Ok(true)`
     /// if the message buffer is still open, or `Ok(false)` if this call caused it to complete.
     ///
-    /// Ths reason this fails gracefully for an out-of-bounds message is so other programs, which may not have
-    /// been involved in deciding how many message buffers should be in this interface, can make mistakes without
-    /// blowing up the program they're sending data. Callers shoudl be careful, however, to inform the sender that
-    /// they are sending data to the void.
-    pub fn send(&self, datum: i8, message_idx: usize) -> Result<bool, Error> {
-        let mut messages = self.messages.write().unwrap();
-        let message = if messages.len() > message_idx {
-            // Already exists (likely partial)
-            messages.get_mut(message_idx).unwrap()
-        } else if messages.len() == message_idx {
-            // Next in line, we need to allocate a new entry
-            drop(messages); // BUG Race condition here??
-            self.push();
-            messages = self.messages.write().unwrap();
-            messages.get_mut(message_idx).unwrap()
+    /// If the message identifier provided does not exist (which may be because the message had already been
+    /// completed and read), then
+    ///
+    /// # Errors
+    ///
+    /// This will fail if the message with the given identifier had already been completed, or it did not exist.
+    /// Either of these cases can be trivially caused by a malicious client, and the caller should therefore be
+    /// careful in how it handles these errors.
+    pub fn send(&self, datum: i8, message_id: usize) -> Result<bool, Error> {
+        if let Some(mut m) = self.messages.get_mut(&message_id) {
+            let (message, complete_lock) = m.value_mut();
+            if complete_lock.completed() {
+                Err(Error::AlreadyCompleted { index: message_id })
+            } else if datum < 0 {
+                complete_lock.mark_complete();
+                Ok(false)
+            } else {
+                message.push(datum as u8);
+                Ok(true)
+            }
         } else {
-            // Need more messages before this one, dump it
-            return Err(Error::OutOfBounds {
-                index: message_idx,
-                max_idx: messages.len() - 1,
-            });
-        };
-
-        if message.1.completed() {
-            Err(Error::AlreadyCompleted { index: message_idx })
-        } else if datum < 0 {
-            message.1.mark_complete();
-            Ok(false)
-        } else {
-            message.0.push(datum as u8);
-            Ok(true)
+            // TODO What should we do here?
+            Err(Error::OutOfBounds { index: message_id })
         }
     }
     /// Sends many bytes through to the interface. When you have many bytes instead of just one at a time, this
     /// method should be preferred. Note that this method will not allow the termination of a message, and that should
     /// be handled separately.
-    pub fn send_many(&self, data: &[u8], message_idx: usize) -> Result<(), Error> {
-        let mut messages = self.messages.write().unwrap();
-        let message = if messages.len() > message_idx {
-            // Already exists (likely partial)
-            messages.get_mut(message_idx).unwrap()
-        } else if messages.len() == message_idx {
-            // Next in line, we need to allocate a new entry
-            drop(messages);
-            self.push();
-            messages = self.messages.write().unwrap();
-            messages.get_mut(message_idx).unwrap()
+    pub fn send_many(&self, data: &[u8], message_id: usize) -> Result<(), Error> {
+        if let Some(mut m) = self.messages.get_mut(&message_id) {
+            let (message, complete_lock) = m.value_mut();
+            if complete_lock.completed() {
+                Err(Error::AlreadyCompleted { index: message_id })
+            } else {
+                message.extend(data);
+                Ok(())
+            }
         } else {
-            // Need more messages before this one, dump it
-            return Err(Error::OutOfBounds {
-                index: message_idx,
-                max_idx: messages.len() - 1,
-            });
-        };
-
-        if message.1.completed() {
-            Err(Error::AlreadyCompleted { index: message_idx })
-        } else {
-            message.0.extend(data);
-            Ok(())
+            // TODO What should we do here?
+            Err(Error::OutOfBounds { index: message_id })
         }
     }
     /// Explicitly terminates the message with the given index. This will return an error if the message
     /// has already been terminated or if it was out-of-bounds.
-    pub fn terminate_message(&self, message_idx: usize) -> Result<(), Error> {
-        let mut messages = self.messages.write().unwrap();
-        let message = if messages.len() > message_idx {
-            // Already exists (likely partial)
-            messages.get_mut(message_idx).unwrap()
-        } else if messages.len() == message_idx {
-            // Next in line, we need to allocate a new entry
-            // This is possible for a termination operation if the message is zero-sized
-            drop(messages);
-            self.push();
-            messages = self.messages.write().unwrap();
-            messages.get_mut(message_idx).unwrap()
+    pub fn terminate_message(&self, message_id: usize) -> Result<(), Error> {
+        if let Some(mut m) = self.messages.get_mut(&message_id) {
+            let (_message, complete_lock) = m.value_mut();
+            if complete_lock.completed() {
+                Err(Error::AlreadyCompleted { index: message_id })
+            } else {
+                complete_lock.mark_complete();
+                Ok(())
+            }
         } else {
-            // Need more messages before this one, dump it
-            return Err(Error::OutOfBounds {
-                index: message_idx,
-                max_idx: messages.len() - 1,
-            });
-        };
-
-        if message.1.completed() {
-            Err(Error::AlreadyCompleted { index: message_idx })
-        } else {
-            message.1.mark_complete();
-            Ok(())
+            // TODO What should we do here?
+            Err(Error::OutOfBounds { index: message_id })
         }
     }
     /// Gets an object of the given type from the given message buffer index of the interface. This will block
@@ -341,29 +330,27 @@ impl Interface {
     /// Same as `.get()`, but gets the raw byte array instead. Note that this will copy the underlying bytes to return
     /// them outside the thread-lock.
     ///
-    /// This will block until the message with the given index has been created and completed.
+    /// This will block until the message with the given identifier has been created and completed.
     ///
     /// Note that this method will extract the underlying message from the given buffer index, leaving it
     /// available for future messages or procedure call metadata. This means that requesting the same message
     /// index may yield completely different data.
-    pub fn get_raw(&self, message_idx: usize) -> Vec<u8> {
+    pub fn get_raw(&self, message_id: usize) -> Vec<u8> {
         // We need two completion locks to be ready before we're ready: the first is
         // a creation lock on the message index, and the second is a lock on its
         // actual completion. We'll start by creating a new completion lock if one
         // doesn't already exist. Any future creations will thereby trigger it. Of
         // course, we won't need to do this if the entry already exists.
         let message_lock = {
-            // Mutable for reassignment
-            let mut messages = self.messages.read().unwrap();
-            let message = if let Some(message) = messages.get(message_idx) {
+            let message = if let Some(message) = self.messages.get(&message_id) {
                 message
             } else {
-                drop(messages);
-                let lock = if let Some(lock) = self.creation_locks.get(&message_idx) {
+                let lock = if let Some(lock) = self.creation_locks.get(&message_id) {
                     lock.clone()
                 } else {
+                    // This is the only time at which we create a new creation lock
                     let lock = CompleteLock::new();
-                    self.creation_locks.insert(message_idx, lock.clone());
+                    self.creation_locks.insert(message_id, lock.clone());
                     lock
                 };
 
@@ -371,10 +358,12 @@ impl Interface {
                 // Now delete that lock to free up some space
                 // Note that our read-only creation locks instance will definitely have been dropped
                 // by this point
-                self.creation_locks.remove(&message_idx);
+                self.creation_locks.remove(&message_id);
 
-                messages = self.messages.read().unwrap();
-                messages.get(message_idx).unwrap()
+                // We can guarantee that this will exist now
+                self.messages
+                    .get(&message_id)
+                    .expect("complete lock should signal that message exists")
             };
             // Cheap clone
             message.1.clone()
@@ -382,11 +371,11 @@ impl Interface {
 
         message_lock.wait_for_completion();
 
-        let mut messages = self.messages.write().unwrap();
-        let (message, _complete_lock) = std::mem::replace(
-            messages.get_mut(message_idx).unwrap(),
-            (Vec::new(), CompleteLock::new()),
-        );
+        // This definitely exists if we got here (and it logically has to).
+        // Note that this will also prepare the message identifier for reuse.
+        // This is safe to call because we only hold a clone of the completion
+        // lock.
+        let (message, _complete_lock) = self.pop(message_id).unwrap();
         message
     }
 }

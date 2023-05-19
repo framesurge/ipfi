@@ -8,6 +8,9 @@ static INTERFACE: Lazy<Interface> = Lazy::new(|| Interface::new());
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     INTERFACE.add_procedure(0, print_hello);
+    // TODO Make these remote reservations instead
+    INTERFACE.push();
+    INTERFACE.push();
 
     let wire = Wire::new(&INTERFACE);
     wire.start(std::io::stdin(), std::io::stdout());
@@ -37,6 +40,9 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     INTERFACE.add_procedure(0, print_hello);
+    // TODO Make these remote reservations instead
+    INTERFACE.push();
+    INTERFACE.push();
 
     let wire = Wire::new(&INTERFACE);
     // We have no threads, so we'll read until the host sends end-of-input
