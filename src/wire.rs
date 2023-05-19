@@ -3,8 +3,8 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{error::Error, interface::Interface, procedure_args::ProcedureArgs};
 use std::{
     collections::HashMap,
-    io::{self, Read, Write},
-    sync::{Arc, Mutex},
+    io::{Read, Write},
+    sync::{Arc, Mutex, RwLock},
 };
 
 /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
@@ -12,9 +12,28 @@ use std::{
 /// This wire sets up an internal message queue of data needing to be sent, allowing bidirectional messaging even over locked buffers (such as stdio)
 /// without leading to race conditions.
 ///
+/// # Termination
+///
+/// An important concept in IPFI is that there can be many [`Wire`]s to one [`Interface`], and that, although it's generally not a good idea, there
+/// can be many input/output buffers for a single [`Wire`]. However, fundamentally a wire represents a connection between the local program and some remote
+/// program, which means that, when the remote program terminates, continuing to use the wire is invalid. As such, wires maintain an internal flag
+/// that notes whether or not the other side has terminated them yet, and, if this flag is found to be set, all operation on the wire will fail.
+///
+/// The main method used for reading data into an IPFI [`Interface`] is `wire.fill()`, which will attempt to read as many full messages as it can before
+/// one ends (messages can be sent in as many partials as the sender pleases). If an `UnexpectedEof` error occurs here, the termination flag will
+/// automatically be set under the assumption that the remote program has terminated. In some rare cases, you may wish to recover from this, which can
+/// be done by creating a new [`Wire`] (i.e. once a wire has been terminated, it can no longer be used, and all method calls will immediately fail).
+///
 /// # Procedure calls
 ///
 /// ## Call indices
+///
+/// IPFI manages procedure calls through a system of procedure indices (e.g. the `print_hello()` procedure might be assigned index 0, you as the programmer
+/// control this) and *call indices*. Since a procedure call can be done piecemeal, with even fractions of arguments being sent as raw bytes, the remote
+/// program must be able to know which partials are associated with each other so it can accumulate the partials into one place for later assembly. This
+/// is done through call indices, which are essentially counters maintained by each wire that mark how many times it has executed a certain procedure.
+/// Then, on the remote side, messages received on the same wire from the same call index of a certain procedure index will be grouped together and
+/// interpreted as one set of arguments when a message is sent that marks the call as complete, allowing it to be properly executed.
 ///
 /// ## Transmitting arguments as bytes
 ///
@@ -34,6 +53,7 @@ use std::{
 /// Note that, unless you're working on extremely low-level applications, 99% of the time the `.call()` method will be absolutely fine for you, and
 /// if you want to send a few complete arguments at a time, you can use the partial methods that let you provide something implementing [`ProcedureArgs`],
 /// a trait that will perform the underlying serialization for you.
+#[derive(Clone)]
 pub struct Wire<'a> {
     /// The unique identifier the attached interface has assigned to this wire.
     id: usize,
@@ -47,9 +67,39 @@ pub struct Wire<'a> {
     remote_call_counter: Arc<Mutex<HashMap<usize, usize>>>,
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed.
     response_idx_map: Arc<Mutex<HashMap<(usize, usize), usize>>>,
+    /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
+    ///
+    /// This is protected by an [`RwLock`] because it is much more common to read from it than to write to it, and this should offer better
+    /// real-world performance by reducing concurrent 'stutters'.
+    terminated: Arc<RwLock<bool>>,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Wire<'static> {
+    /// Starts an autonomous version of the wire by starting two new threads, one for reading and one for writing. If you call this,
+    /// it is superfluous to call `.fill()`/`.flush()`, as they will be automatically called from here on.
+    ///
+    /// This method is only available when a `'static` reference to the [`Interface`] is held, since only that can be passed safely between
+    /// threads. You must also own both the reader and writer in order to use this method (which typically means this method must hold
+    /// those two exclusively).
+    pub fn start(
+        &self,
+        mut reader: impl Read + Send + Sync + 'static,
+        mut writer: impl Write + Send + Sync + 'static,
+    ) {
+        let self_reader = self.clone();
+        std::thread::spawn(move || while self_reader.fill(&mut reader).is_ok() {});
+        let self_writer = self.clone();
+        std::thread::spawn(move || {
+            // TODO Spinning...
+            while self_writer.flush(&mut writer).is_ok() {
+                std::hint::spin_loop();
+            }
+        });
+    }
 }
 impl<'a> Wire<'a> {
-    /// Creates a new buffer-based wire to work with the given interface.
+    /// Creates a new buffer-based wire to work with the given interface. This takes in the interface to work with and a writeable
+    /// buffer to use for termination when this wire is dropped.
     pub fn new(interface: &'a Interface) -> Self {
         Self {
             id: interface.get_id(),
@@ -57,7 +107,20 @@ impl<'a> Wire<'a> {
             queue: Arc::new(Mutex::new(Vec::new())),
             remote_call_counter: Arc::new(Mutex::new(HashMap::new())),
             response_idx_map: Arc::new(Mutex::new(HashMap::new())),
+
+            // If we detect an EOF, this will be set
+            terminated: Arc::new(RwLock::new(false)),
         }
+    }
+    /// Asks the wire whether or not it has been terminated. This polls an internal flag that can be read by many threads
+    /// simultaneously, and as such this operation is cheap.
+    ///
+    /// See the `struct` documentation for further information about wire termination.
+    #[inline(always)]
+    pub fn is_terminated(&self) -> bool {
+        // This implicitly performs a quick release to ensure that a writer can obtain the lock as soon as possible if necessary,
+        // minimising the time between termination and notification through mass operation failure
+        *self.terminated.read().unwrap()
     }
     // /// Creates a new buffer-based wire from the given interface, using stdin as an input and stdout as an output. Generally,
     // /// this should be used by modules executed as child processes by the hosts they want to communicate with.
@@ -82,6 +145,10 @@ impl<'a> Wire<'a> {
         procedure_idx: usize,
         args: impl ProcedureArgs,
     ) -> Result<CallHandle, Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         let args = args.into_bytes()?;
         self.call_with_bytes(procedure_idx, &args)
     }
@@ -100,6 +167,10 @@ impl<'a> Wire<'a> {
         procedure_idx: usize,
         args: impl ProcedureArgs,
     ) -> Result<usize, Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         let args = args.into_bytes()?;
         self.start_call_with_partial_bytes(procedure_idx, &args)
     }
@@ -112,6 +183,10 @@ impl<'a> Wire<'a> {
         procedure_idx: usize,
         args: &[u8],
     ) -> Result<usize, Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         if args.len() == 0 {
             return Err(Error::ZeroLengthInNonTerminating);
         }
@@ -147,6 +222,10 @@ impl<'a> Wire<'a> {
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
     pub fn call_with_bytes(&self, procedure_idx: usize, args: &[u8]) -> Result<CallHandle, Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         // We allow zero-length payloads here (for functions with no arguments in particular)
 
         let mut rcc = self.remote_call_counter.lock().unwrap();
@@ -198,6 +277,10 @@ impl<'a> Wire<'a> {
         call_idx: usize,
         args: impl ProcedureArgs,
     ) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         let args = args.into_bytes()?;
         self.continue_given_call_with_bytes(procedure_idx, call_idx, &args)
     }
@@ -210,6 +293,10 @@ impl<'a> Wire<'a> {
         call_idx: usize,
         args: &[u8],
     ) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         if args.len() == 0 {
             return Err(Error::ZeroLengthInNonTerminating);
         }
@@ -239,6 +326,10 @@ impl<'a> Wire<'a> {
         procedure_idx: usize,
         call_idx: usize,
     ) -> Result<CallHandle, Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         // Get the response index we're using
         let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
         // Construct the zero-length payload message we want to send
@@ -261,6 +352,10 @@ impl<'a> Wire<'a> {
     /// this will return an error.
     #[inline]
     fn get_response_idx(&self, procedure_idx: usize, call_idx: usize) -> Result<usize, Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         let rim = self.response_idx_map.lock().unwrap();
         rim.get(&(procedure_idx, call_idx))
             .cloned()
@@ -275,6 +370,10 @@ impl<'a> Wire<'a> {
     ///
     /// This will not send a termination signal.
     pub fn send_bytes(&self, bytes: &[u8], message_idx: usize) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         let msg = Message::General {
             message_idx,
             message: bytes,
@@ -290,6 +389,10 @@ impl<'a> Wire<'a> {
         msg: &T,
         message_idx: usize,
     ) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         let bytes = rmp_serde::to_vec(msg)?;
         self.send_bytes(&bytes, message_idx)?;
         self.end_message(message_idx)
@@ -297,6 +400,10 @@ impl<'a> Wire<'a> {
     /// Sends a termination signal over the wire for the given message index. After this is called, further bytes will
     /// not be able to be sent for this message.
     pub fn end_message(&self, message_idx: usize) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         let msg = Message::General {
             message_idx,
             message: &[],
@@ -311,7 +418,14 @@ impl<'a> Wire<'a> {
     ///
     /// If a procedure call is completed in this read, this method will automatically block waiting for the response,
     /// and it will followingly add said response to the internal writer queue.
-    pub fn receive_one(&self, reader: &mut impl Read) -> Result<(), Error> {
+    ///
+    /// This returns whether or not it read a message/call termination message (needed internally for `.fill()`). That
+    /// will also return `true` if a wire termination message is received.
+    pub fn receive_one(&self, reader: &mut impl Read) -> Result<bool, Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         // First is the type of message
         let mut ty_buf = [0u8];
         reader.read_exact(&mut ty_buf)?;
@@ -366,6 +480,7 @@ impl<'a> Wire<'a> {
                         }
                         .to_bytes()?,
                     );
+                    Ok(true)
                 } else {
                     // We're continuing or starting a new partial procedure argument addition, so get a local message
                     // buffer for it if there isn't already one
@@ -375,6 +490,7 @@ impl<'a> Wire<'a> {
 
                     // This will accumulate argument bytes over potentially many continuations in the local call buffer
                     self.interface.send_many(&bytes, call_buf_idx)?;
+                    Ok(false)
                 }
             }
             // General message
@@ -392,27 +508,34 @@ impl<'a> Wire<'a> {
                 // If that's zero, we should end the message
                 if num_bytes == 0 {
                     self.interface.terminate_message(message_idx)?;
+                    Ok(true)
                 } else {
                     let mut bytes = vec![0u8; num_bytes];
                     reader.read_exact(&mut bytes)?;
 
                     self.interface.send_many(&bytes, message_idx)?;
+                    Ok(false)
                 }
             }
             // Termination: the other program is shutting down and is no longer capable of receiving messages
             // This is the IPFI equivalent of 'expected EOF'
             0 => {
-                todo!()
+                // This will lead all other operation to fail, potentially in the middle of their work
+                *self.terminated.write().unwrap() = true;
+
+                Ok(true)
             }
             // Unknown message types will be ignored
-            _ => {}
+            _ => Ok(false),
         }
-
-        Ok(())
     }
 
     /// Writes all messages currently in the internal write queue to the given output stream.
-    pub fn flush(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
+    pub fn flush(&self, writer: &mut impl Write) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
         // This will remove the written messages from the queue
         for msg_bytes in self.queue.lock().unwrap().drain(..) {
             writer.write_all(&msg_bytes)?;
@@ -421,9 +544,48 @@ impl<'a> Wire<'a> {
 
         Ok(())
     }
-    // TODO
-    pub fn fill(&self) -> Result<(), std::io::Error> {
-        todo!()
+    /// An ergonomic equivalent of `.receive_one()` that receives messages until a termination message is sent. This guarantees only
+    /// that one message will have been fully received, and, since IPFI supports concurrent message transmission, it is entirely possible
+    /// that message A may start, then message B may start, and then message A may end, before message B finally ends. In this case,
+    /// this method would capture the entirety of message A, including termination, but only part of message B. As such, this method
+    /// is generally best used in cases where communication is generally very predictable.
+    ///
+    /// This method should almost never be used in multi-threaded situations, and the `.open()` method should definitely be preferred,
+    /// as that mitigates the need to ever manually manage filling and flushing.
+    ///
+    /// **WARNING:** This method will internally handle `UnexpectedEof` errors and terminate the wire itself, assuming that the given
+    /// buffer is the only means of communication with the other side of the wire. If this is not the case, you should manually call
+    /// `.receive_one()` until it returns `Ok(false)`, to mimic the behaviour of this method. Note that such errors will still be returned,
+    /// after the termination flag has been set.
+    pub fn fill(&self, reader: &mut impl Read) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
+        // Read until a message termination
+        loop {
+            match self.receive_one(reader) {
+                // We got a full message, so end if it was the end of a message, or continue if there's more to be read
+                Ok(message_ended) => {
+                    if message_ended {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+                // If we run into an unexpected EOF at any time during the `.receive_one()` call, the other side has almost
+                // certainly terminated from that buffer
+                Err(Error::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // This  will prevent all further operations on this wire
+                    *self.terminated.write().unwrap() = true;
+                    return Err(Error::IoError(err));
+                }
+                // Any unexpected errors should be propagated
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -443,6 +605,22 @@ impl<'a> CallHandle<'a> {
     pub fn wait<T: DeserializeOwned>(&self) -> Result<T, Error> {
         self.interface.get(self.response_idx)
     }
+}
+
+/// Signals the termination of this program to any others that may be holding wires to it.
+///
+/// Generally, it is a good idea to call this function in the cleanup of your program, including if any errors occur,
+/// however, if you're using the common pattern of communciating with another program through your own program's
+/// stdout stream, you won't need to, as shutting down will close that stream and send an EOF signal, which the other
+/// program will detect, implicitly causing a termination and preventing further writes.
+///
+/// For more information on wire terminations, see [`Wire`].
+pub fn signal_termination(writer: &mut impl Write) -> Result<(), std::io::Error> {
+    let msg = Message::Termination;
+    let bytes = msg.to_bytes()?;
+    writer.write_all(&bytes)?;
+
+    Ok(())
 }
 
 /// A typed representation of a message to be sent down the wire, which can be transformed into a byte vector
@@ -556,17 +734,34 @@ impl<'b> Message<'b> {
     }
 }
 
-/// Signals the termination of this program to the given output stream. In programs that principally communicate with
-/// other programs through IPFI, this should be sent when the program terminates, after both the interface and wire
-/// have been cleaned up, in order to ensure that other programs do not attempt to send further messages to this one.
-///
-/// Typically, this will be called in the cleanup of module processes spawned by some host, and stdout will be the
-/// chosen buf.
-pub fn signal_termination(writer: &mut impl Write) -> Result<(), std::io::Error> {
-    writer.write_all(&[0])?;
-    writer.flush()?;
+struct TerminationFlag<'a> {
+    buf: &'a mut dyn Write,
+    is_terminated: bool,
+}
+impl TerminationFlag<'_> {
+    fn is_terminated(&self) -> bool {
+        self.is_terminated
+    }
+    /// Records that the local side of this wire has been terminated, setting the termination flag to `true`
+    /// and sending a termination message to the remote.
+    fn mark_local_terminated(&mut self) -> Result<(), std::io::Error> {
+        self.is_terminated = true;
+        self.buf.write_all(&[0])?;
+        self.buf.flush()?;
 
-    Ok(())
+        Ok(())
+    }
+    /// Records that the remote side of this wire has been terminated, setting the termination flag to `true`
+    /// *without* sending any message over the termination buffer (which is assumed to no longer be being watched).
+    fn mark_remote_terminated(&mut self) {
+        self.is_terminated = true;
+    }
+}
+impl Drop for TerminationFlag<'_> {
+    fn drop(&mut self) {
+        // If we can't write the termination signal, we'll fall back to hoping EOF was written
+        let _ = self.mark_local_terminated();
+    }
 }
 
 #[cfg(test)]

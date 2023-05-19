@@ -2,7 +2,7 @@ use crate::{complete_lock::CompleteLock, error::Error, procedure_args::Tuple};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Mutex, RwLock},
 };
 
 /// A procedure registered on an interface.

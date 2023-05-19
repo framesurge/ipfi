@@ -30,4 +30,6 @@ pub enum Error {
     // This should basically never occur
     #[error("couldn't write length marker for accumulated arguments (likely spontaneous failure)")]
     WriteLenMarkerFailed,
+    #[error("this wire has been terminated from the other side, and operations can no longer be performed")]
+    WireTerminated,
 }
