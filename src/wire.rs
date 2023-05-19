@@ -187,7 +187,7 @@ impl<'a> Wire<'a> {
             return Err(Error::WireTerminated);
         }
 
-        if args.len() == 0 {
+        if args.is_empty() {
             return Err(Error::ZeroLengthInNonTerminating);
         }
 
@@ -297,7 +297,7 @@ impl<'a> Wire<'a> {
             return Err(Error::WireTerminated);
         }
 
-        if args.len() == 0 {
+        if args.is_empty() {
             return Err(Error::ZeroLengthInNonTerminating);
         }
 
@@ -707,7 +707,7 @@ impl<'b> Message<'b> {
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
                 // Step 5 (only bother if we're not terminating)
-                if args.len() > 0 {
+                if !args.is_empty() {
                     buf.write_all(args)?;
                 }
             }
@@ -724,43 +724,13 @@ impl<'b> Message<'b> {
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
                 // Step 3 (only bother if we're not terminating)
-                if message.len() > 0 {
+                if !message.is_empty() {
                     buf.write_all(message)?;
                 }
             }
         }
 
         Ok(buf)
-    }
-}
-
-struct TerminationFlag<'a> {
-    buf: &'a mut dyn Write,
-    is_terminated: bool,
-}
-impl TerminationFlag<'_> {
-    fn is_terminated(&self) -> bool {
-        self.is_terminated
-    }
-    /// Records that the local side of this wire has been terminated, setting the termination flag to `true`
-    /// and sending a termination message to the remote.
-    fn mark_local_terminated(&mut self) -> Result<(), std::io::Error> {
-        self.is_terminated = true;
-        self.buf.write_all(&[0])?;
-        self.buf.flush()?;
-
-        Ok(())
-    }
-    /// Records that the remote side of this wire has been terminated, setting the termination flag to `true`
-    /// *without* sending any message over the termination buffer (which is assumed to no longer be being watched).
-    fn mark_remote_terminated(&mut self) {
-        self.is_terminated = true;
-    }
-}
-impl Drop for TerminationFlag<'_> {
-    fn drop(&mut self) {
-        // If we can't write the termination signal, we'll fall back to hoping EOF was written
-        let _ = self.mark_local_terminated();
     }
 }
 

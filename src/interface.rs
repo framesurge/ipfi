@@ -12,6 +12,7 @@ pub struct Procedure {
     ///
     /// The bytes this takes for its arguments will *not* have a MessagePack length marker set at the front,
     /// and that will be added internally at deserialization.
+    #[allow(clippy::type_complexity)]
     closure: Box<dyn Fn(&[u8]) -> Result<Vec<u8>, Error> + Send + Sync + 'static>,
 }
 
@@ -51,10 +52,8 @@ pub struct Interface {
     /// in `uuid` or a similar crate, we manage these identifiers manually.
     next_wire_id: Mutex<usize>,
 }
-impl Interface {
-    /// Initializes a new interface to be used for connecting to as many other programs as necessary through wires,
-    /// or through manual communication management.
-    pub fn new() -> Self {
+impl Default for Interface {
+    fn default() -> Self {
         Self {
             messages: RwLock::new(Vec::new()),
             creation_locks: RwLock::new(HashMap::new()),
@@ -62,6 +61,13 @@ impl Interface {
             call_to_buffer_map: Mutex::new(HashMap::new()),
             next_wire_id: Mutex::new(0),
         }
+    }
+}
+impl Interface {
+    /// Initializes a new interface to be used for connecting to as many other programs as necessary through wires,
+    /// or through manual communication management.
+    pub fn new() -> Self {
+        Self::default()
     }
     /// Gets an ID for a wire or other communication primitive that will depend on this interface. Any IPC primitive
     /// that will call procedures should acquire one of these for itself to make sure its procedure calls do not overlap
