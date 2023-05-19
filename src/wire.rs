@@ -1,8 +1,8 @@
+use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{error::Error, interface::Interface, procedure_args::ProcedureArgs};
 use std::{
-    collections::HashMap,
     io::{Read, Write},
     sync::{Arc, Mutex, RwLock},
 };
@@ -64,9 +64,9 @@ pub struct Wire<'a> {
     queue: Arc<Mutex<Vec<Vec<u8>>>>,
     /// A map that keeps track of how many times each remote procedure has been called, allowing call indices to be intelligently
     /// and largely internally handled.
-    remote_call_counter: Arc<Mutex<HashMap<usize, usize>>>,
+    remote_call_counter: Arc<DashMap<usize, usize>>,
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed.
-    response_idx_map: Arc<Mutex<HashMap<(usize, usize), usize>>>,
+    response_idx_map: Arc<DashMap<(usize, usize), usize>>,
     /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
     ///
     /// This is protected by an [`RwLock`] because it is much more common to read from it than to write to it, and this should offer better
@@ -105,8 +105,8 @@ impl<'a> Wire<'a> {
             id: interface.get_id(),
             interface,
             queue: Arc::new(Mutex::new(Vec::new())),
-            remote_call_counter: Arc::new(Mutex::new(HashMap::new())),
-            response_idx_map: Arc::new(Mutex::new(HashMap::new())),
+            remote_call_counter: Arc::new(DashMap::new()),
+            response_idx_map: Arc::new(DashMap::new()),
 
             // If we detect an EOF, this will be set
             terminated: Arc::new(RwLock::new(false)),
@@ -179,25 +179,25 @@ impl<'a> Wire<'a> {
             return Err(Error::ZeroLengthInNonTerminating);
         }
 
-        let mut rcc = self.remote_call_counter.lock().unwrap();
         // Create a new entry in the remote call counter for this call index
-        let call_idx = if let Some(last_call_idx) = rcc.get(&procedure_idx).as_mut() {
-            // We need to update what's in there
-            let new_call_idx = *last_call_idx + 1;
-            *last_call_idx = &new_call_idx;
-            new_call_idx
-        } else {
-            // We need to insert a new entry
-            rcc.insert(procedure_idx, 0);
-            0
-        };
+        let call_idx =
+            if let Some(mut last_call_idx) = self.remote_call_counter.get_mut(&procedure_idx) {
+                // We need to update what's in there
+                let new_call_idx = *last_call_idx + 1;
+                *last_call_idx = new_call_idx;
+                new_call_idx
+            } else {
+                // We need to insert a new entry
+                self.remote_call_counter.insert(procedure_idx, 0);
+                0
+            };
         // Allocate a new message buffer on the interface that we'll receive the response into
         let response_idx = self.interface.push();
         // Add that to the remote index map so we can retrieve it for later continutation and termination
         // of this call
         {
-            let mut rim = self.response_idx_map.lock().unwrap();
-            rim.insert((procedure_idx, call_idx), response_idx);
+            self.response_idx_map
+                .insert((procedure_idx, call_idx), response_idx);
         }
 
         // This doesn't need to access the remote call counter, so we can leave it be safely
@@ -216,26 +216,24 @@ impl<'a> Wire<'a> {
 
         // We allow zero-length payloads here (for functions with no arguments in particular)
 
-        let mut rcc = self.remote_call_counter.lock().unwrap();
         // Create a new entry in the remote call counter for this call index
-        let call_idx = if let Some(last_call_idx) = rcc.get(&procedure_idx).as_mut() {
-            // We need to update what's in there
-            let new_call_idx = *last_call_idx + 1;
-            *last_call_idx = &new_call_idx;
-            new_call_idx
-        } else {
-            // We need to insert a new entry
-            rcc.insert(procedure_idx, 0);
-            0
-        };
+        let call_idx =
+            if let Some(mut last_call_idx) = self.remote_call_counter.get_mut(&procedure_idx) {
+                // We need to update what's in there
+                let new_call_idx = *last_call_idx + 1;
+                *last_call_idx = new_call_idx;
+                new_call_idx
+            } else {
+                // We need to insert a new entry
+                self.remote_call_counter.insert(procedure_idx, 0);
+                0
+            };
         // Allocate a new message buffer on the interface that we'll receive the response into
         let response_idx = self.interface.push();
         // Add that to the remote index map so we can retrieve it for later continutation and termination
         // of this call
-        {
-            let mut rim = self.response_idx_map.lock().unwrap();
-            rim.insert((procedure_idx, call_idx), response_idx);
-        }
+        self.response_idx_map
+            .insert((procedure_idx, call_idx), response_idx);
 
         // Get the response index we're using
         let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
@@ -353,9 +351,9 @@ impl<'a> Wire<'a> {
             return Err(Error::WireTerminated);
         }
 
-        let rim = self.response_idx_map.lock().unwrap();
-        rim.get(&(procedure_idx, call_idx))
-            .cloned()
+        self.response_idx_map
+            .get(&(procedure_idx, call_idx))
+            .map(|x| x.clone())
             .ok_or(Error::NoResponseBuffer {
                 index: procedure_idx,
                 call_idx,

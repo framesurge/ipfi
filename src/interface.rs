@@ -1,9 +1,7 @@
 use crate::{complete_lock::CompleteLock, error::Error, procedure_args::Tuple};
+use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{Mutex, RwLock},
-};
+use std::sync::{Mutex, RwLock};
 
 /// A procedure registered on an interface.
 pub struct Procedure {
@@ -34,10 +32,10 @@ pub struct Interface {
     /// A record of locks used to wait on the existence of a certain message
     /// index. Since multiple threads could simultaneously wait for different message
     /// indices, this has to be implemented this way!
-    creation_locks: RwLock<HashMap<usize, CompleteLock>>,
+    creation_locks: DashMap<usize, CompleteLock>,
     /// A list of procedures registered on this interface that those communicating with this
     /// program may execute.
-    procedures: RwLock<HashMap<usize, Procedure>>,
+    procedures: DashMap<usize, Procedure>,
     /// A map of procedure call indices and the wire IDs that produced them to local message buffer addresses.
     /// These are necessary because, when a program sends a partial procedure call, and then later completes it,
     /// we need to know that the two messages are part of the same call. On their side, the caller will maintain
@@ -45,7 +43,7 @@ pub struct Interface {
     /// as necessary.
     ///
     /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
-    call_to_buffer_map: Mutex<HashMap<(usize, usize, usize), usize>>,
+    call_to_buffer_map: DashMap<(usize, usize, usize), usize>,
     /// The unique numerical identifier that will be used for the next wire that connects to this interface.
     /// We map call indices to message buffers, but, since one interface can be used to connect to many wires,
     /// call indices are likely to overlap, so every wire must have a unique identifier. Instead of pulling
@@ -56,9 +54,9 @@ impl Default for Interface {
     fn default() -> Self {
         Self {
             messages: RwLock::new(Vec::new()),
-            creation_locks: RwLock::new(HashMap::new()),
-            procedures: RwLock::new(HashMap::new()),
-            call_to_buffer_map: Mutex::new(HashMap::new()),
+            creation_locks: DashMap::new(),
+            procedures: DashMap::new(),
+            call_to_buffer_map: DashMap::new(),
             next_wire_id: Mutex::new(0),
         }
     }
@@ -122,7 +120,7 @@ impl Interface {
             Ok(ret)
         });
         let procedure = Procedure { closure };
-        self.procedures.write().unwrap().insert(idx, procedure);
+        self.procedures.insert(idx, procedure);
     }
     /// Calls the procedure with the given index, returning the raw serialized byte vector it produces. This will get its
     /// argument information from the given internal message buffer index, which it expects to be completed. This method
@@ -138,10 +136,10 @@ impl Interface {
     ) -> Result<Vec<u8>, Error> {
         // Get the buffer where the arguments are supposed to be, and then delete that mapping to free up some space
         let args_buf_idx = self.get_call_buffer(procedure_idx, call_idx, wire_id);
-        let mut map = self.call_to_buffer_map.lock().unwrap();
-        map.remove(&(procedure_idx, call_idx, wire_id));
+        self.call_to_buffer_map
+            .remove(&(procedure_idx, call_idx, wire_id));
 
-        if let Some(procedure) = self.procedures.read().unwrap().get(&procedure_idx) {
+        if let Some(procedure) = self.procedures.get(&procedure_idx) {
             let messages = self.messages.read().unwrap();
             if let Some((args, complete_lock)) = messages.get(args_buf_idx) {
                 if complete_lock.completed() {
@@ -168,12 +166,15 @@ impl Interface {
     ///
     /// This will create a buffer for this call if one doesn't already exist, and otherwise it will create one.
     pub fn get_call_buffer(&self, procedure_idx: usize, call_idx: usize, wire_id: usize) -> usize {
-        let mut map = self.call_to_buffer_map.lock().unwrap();
-        let buf_idx = if let Some(buf_idx) = map.get(&(procedure_idx, call_idx, wire_id)) {
+        let buf_idx = if let Some(buf_idx) =
+            self.call_to_buffer_map
+                .get(&(procedure_idx, call_idx, wire_id))
+        {
             *buf_idx
         } else {
             let new_idx = self.push();
-            map.insert((procedure_idx, call_idx, wire_id), new_idx);
+            self.call_to_buffer_map
+                .insert((procedure_idx, call_idx, wire_id), new_idx);
             new_idx
         };
 
@@ -190,8 +191,7 @@ impl Interface {
         messages.push((Vec::new(), CompleteLock::new()));
 
         // If anyone was waiting for this buffer to exist, it now does!
-        let mut creation_locks = self.creation_locks.write().unwrap();
-        if let Some(lock) = creation_locks.get_mut(&new_idx) {
+        if let Some(lock) = self.creation_locks.get_mut(&new_idx) {
             lock.mark_complete();
         }
 
@@ -326,18 +326,12 @@ impl Interface {
                 message
             } else {
                 drop(messages);
-                // Mutable for reassignment
-                let creation_locks = self.creation_locks.read().unwrap();
-                let lock = if let Some(lock) = creation_locks.get(&message_idx) {
+                let lock = if let Some(lock) = self.creation_locks.get(&message_idx) {
                     let lock = lock.clone();
-                    drop(creation_locks);
                     lock
                 } else {
                     let lock = CompleteLock::new();
-                    // Upgrade to a writeable lock
-                    drop(creation_locks);
-                    let mut creation_locks_w = self.creation_locks.write().unwrap();
-                    creation_locks_w.insert(message_idx, lock.clone());
+                    self.creation_locks.insert(message_idx, lock.clone());
                     lock
                 };
 
@@ -345,8 +339,7 @@ impl Interface {
                 // Now delete that lock to free up some space
                 // Note that our read-only creation locks instance will definitely have been dropped
                 // by this point
-                let mut creation_locks_w = self.creation_locks.write().unwrap();
-                creation_locks_w.remove(&message_idx);
+                self.creation_locks.remove(&message_idx);
 
                 messages = self.messages.read().unwrap();
                 messages.get(message_idx).unwrap()
