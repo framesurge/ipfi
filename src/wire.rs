@@ -1,3 +1,4 @@
+use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -8,7 +9,10 @@ use crate::{
 };
 use std::{
     io::{Read, Write},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
@@ -65,17 +69,16 @@ pub struct Wire<'a> {
     interface: &'a Interface,
     /// An internal message queue, used for preventing interleaved writing, where part of one message is sent, and then part of another, due
     /// to race conditions. This would be fine if the headers were kept intact, although race conditions are rarely so courteous.
-    queue: Arc<Mutex<Vec<Vec<u8>>>>,
+    ///
+    /// This uses a lock-free queue to maximise concurrent performance.
+    queue: Arc<SegQueue<Vec<u8>>>,
     /// A map that keeps track of how many times each remote procedure has been called, allowing call indices to be intelligently
     /// and largely internally handled.
     remote_call_counter: Arc<DashMap<ProcedureIndex, usize>>,
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed.
     response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), usize>>,
     /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
-    ///
-    /// This is protected by an [`RwLock`] because it is much more common to read from it than to write to it, and this should offer better
-    /// real-world performance by reducing concurrent 'stutters'.
-    terminated: Arc<RwLock<bool>>,
+    terminated: Arc<AtomicBool>,
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl Wire<'static> {
@@ -108,12 +111,12 @@ impl<'a> Wire<'a> {
         Self {
             id: interface.get_id(),
             interface,
-            queue: Arc::new(Mutex::new(Vec::new())),
+            queue: Arc::new(SegQueue::new()),
             remote_call_counter: Arc::new(DashMap::new()),
             response_idx_map: Arc::new(DashMap::new()),
 
             // If we detect an EOF, this will be set
-            terminated: Arc::new(RwLock::new(false)),
+            terminated: Arc::new(AtomicBool::new(false)),
         }
     }
     /// Asks the wire whether or not it has been terminated. This polls an internal flag that can be read by many threads
@@ -122,9 +125,8 @@ impl<'a> Wire<'a> {
     /// See the `struct` documentation for further information about wire termination.
     #[inline(always)]
     pub fn is_terminated(&self) -> bool {
-        // This implicitly performs a quick release to ensure that a writer can obtain the lock as soon as possible if necessary,
-        // minimising the time between termination and notification through mass operation failure
-        *self.terminated.read().unwrap()
+        // All subsequent operations will see our `Ordering::Release` storing
+        self.terminated.load(Ordering::Acquire)
     }
 
     /// Calls the procedure with the given remote procedure index. This will return a handle you can use to block waiting
@@ -254,7 +256,7 @@ impl<'a> Wire<'a> {
         };
         // Convert that message into bytes and place it in the queue
         let bytes = msg.to_bytes()?;
-        self.queue.lock().unwrap().push(bytes);
+        self.queue.push(bytes);
 
         // And neither does this
         // Only write an explicit termination message if we had arguments though, otherwise that would become
@@ -315,7 +317,7 @@ impl<'a> Wire<'a> {
         };
         // Convert that message into bytes and place it in the queue
         let bytes = msg.to_bytes()?;
-        self.queue.lock().unwrap().push(bytes);
+        self.queue.push(bytes);
 
         Ok(())
     }
@@ -344,7 +346,7 @@ impl<'a> Wire<'a> {
         };
         // Convert that message into bytes and place it in the queue
         let bytes = msg.to_bytes()?;
-        self.queue.lock().unwrap().push(bytes);
+        self.queue.push(bytes);
 
         Ok(CallHandle {
             response_idx,
@@ -365,7 +367,7 @@ impl<'a> Wire<'a> {
 
         self.response_idx_map
             .get(&(procedure_idx, call_idx))
-            .map(|x| x.clone())
+            .map(|x| *x)
             .ok_or(Error::NoResponseBuffer {
                 index: procedure_idx.0,
                 call_idx: call_idx.0,
@@ -386,7 +388,7 @@ impl<'a> Wire<'a> {
             message: bytes,
         };
         let bytes = msg.to_bytes()?;
-        self.queue.lock().unwrap().push(bytes);
+        self.queue.push(bytes);
 
         Ok(())
     }
@@ -416,7 +418,7 @@ impl<'a> Wire<'a> {
             message: &[],
         };
         let bytes = msg.to_bytes()?;
-        self.queue.lock().unwrap().push(bytes);
+        self.queue.push(bytes);
 
         Ok(())
     }
@@ -480,10 +482,9 @@ impl<'a> Wire<'a> {
                         message: &ret,
                     };
                     let ret_msg_bytes = ret_msg.to_bytes()?;
-                    let mut queue = self.queue.lock().unwrap();
-                    queue.push(ret_msg_bytes);
+                    self.queue.push(ret_msg_bytes);
                     // And now we need to terminate that result message
-                    queue.push(
+                    self.queue.push(
                         Message::General {
                             message_idx: response_idx,
                             message: &[],
@@ -533,7 +534,7 @@ impl<'a> Wire<'a> {
             // This is the IPFI equivalent of 'expected EOF'
             0 => {
                 // This will lead all other operation to fail, potentially in the middle of their work
-                *self.terminated.write().unwrap() = true;
+                self.mark_terminated();
 
                 Ok(Some(true))
             }
@@ -549,7 +550,7 @@ impl<'a> Wire<'a> {
         }
 
         // This will remove the written messages from the queue
-        for msg_bytes in self.queue.lock().unwrap().drain(..) {
+        while let Some(msg_bytes) = self.queue.pop() {
             writer.write_all(&msg_bytes)?;
         }
         writer.flush()?;
@@ -582,8 +583,8 @@ impl<'a> Wire<'a> {
                 // If we run into an unexpected EOF at any time during the `.receive_one()` call, the other side has almost
                 // certainly terminated from that buffer
                 Err(Error::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // This  will prevent all further operations on this wire
-                    *self.terminated.write().unwrap() = true;
+                    // This will prevent all further operations on this wire
+                    self.mark_terminated();
                     break Err(Error::IoError(err));
                 }
                 // Any unexpected errors should be propagated
@@ -600,9 +601,20 @@ impl<'a> Wire<'a> {
     pub fn signal_end_of_input(&self) -> Result<(), std::io::Error> {
         let msg = Message::EndOfInput;
         let bytes = msg.to_bytes()?;
-        self.queue.lock().unwrap().push(bytes);
+        self.queue.push(bytes);
 
         Ok(())
+    }
+    /// Sets the internal termination flag to `true`, causing all subsequent operations to fail.
+    fn mark_terminated(&self) {
+        // We use `Ordering::Release` to make sure that all subsequent reads see this
+        self.terminated.store(true, Ordering::Release);
+    }
+}
+// Dropping the wire must also relinquish the unique wire identifier
+impl Drop for Wire<'_> {
+    fn drop(&mut self) {
+        self.interface.relinquish_id(self.id);
     }
 }
 

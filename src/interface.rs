@@ -1,9 +1,13 @@
-use crate::{complete_lock::CompleteLock, error::Error, procedure_args::Tuple};
+use crate::{
+    complete_lock::CompleteLock, error::Error, procedure_args::Tuple, roi_queue::RoiQueue,
+};
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 // The following are newtype wrappers that can deliberately only be constructed internally to avoid confusion.
+// This also allows us to keep the internals as implementation details, and to change them without a breaking
+// change if necessary.
 /// A call index. This is its own type to avoid confusion.
 ///
 /// For information about call indices, see [`Wire`].
@@ -64,11 +68,10 @@ pub struct Interface {
     ///
     /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
     call_to_buffer_map: DashMap<(ProcedureIndex, CallIndex, WireId), usize>,
-    /// The unique numerical identifier that will be used for the next wire that connects to this interface.
-    /// We map call indices to message buffers, but, since one interface can be used to connect to many wires,
-    /// call indices are likely to overlap, so every wire must have a unique identifier. Instead of pulling
-    /// in `uuid` or a similar crate, we manage these identifiers manually.
-    next_wire_id: Mutex<usize>,
+    /// A queue that produces unique identifiers for the next wire that connects to this interface. Wire identifiers
+    /// are needed to ensure that call indices, which h may be the same across multiple wires, are kept separate from
+    /// each other. This queue will automatically recirculate relinquished identifiers.
+    wire_id_queue: RoiQueue,
 }
 impl Default for Interface {
     fn default() -> Self {
@@ -77,7 +80,7 @@ impl Default for Interface {
             creation_locks: DashMap::new(),
             procedures: DashMap::new(),
             call_to_buffer_map: DashMap::new(),
-            next_wire_id: Mutex::new(0),
+            wire_id_queue: RoiQueue::new(),
         }
     }
 }
@@ -91,10 +94,15 @@ impl Interface {
     /// that will call procedures should acquire one of these for itself to make sure its procedure calls do not overlap
     /// with those of other wires. Typically, this will be called internally by the [`crate::Wire`] type.
     pub fn get_id(&self) -> WireId {
-        let mut next_next_wire_id = self.next_wire_id.lock().unwrap();
-        let next_wire_id = *next_next_wire_id;
-        *next_next_wire_id += 1;
-        WireId(next_wire_id)
+        WireId(self.wire_id_queue.get())
+    }
+    /// Marks the given wire identifier as relinquished. This will return it into the queue and recirculate it to the next
+    /// new wire that requests an identifier. As such, the provided identifier *must not* be reused after it is provided to this
+    /// call.
+    ///
+    /// Generally, this should be called within drop implementations, and it is not necessary to call this for the inbuilt [`Wire`].
+    pub fn relinquish_id(&self, id: WireId) {
+        self.wire_id_queue.relinquish(id.0);
     }
     /// Adds the given function as a procedure on this interface, which will allow other programs interacting with
     /// this one to execute it. Critically, no validation of intent or origin is requires to remotely execute procedures
@@ -352,8 +360,7 @@ impl Interface {
             } else {
                 drop(messages);
                 let lock = if let Some(lock) = self.creation_locks.get(&message_idx) {
-                    let lock = lock.clone();
-                    lock
+                    lock.clone()
                 } else {
                     let lock = CompleteLock::new();
                     self.creation_locks.insert(message_idx, lock.clone());
