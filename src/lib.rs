@@ -4,5 +4,5 @@ mod interface;
 mod procedure_args;
 mod wire;
 
-pub use crate::interface::Interface;
+pub use crate::interface::{CallIndex, Interface, ProcedureIndex, WireId};
 pub use crate::wire::{signal_termination, Wire};

@@ -1,7 +1,11 @@
 use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::{error::Error, interface::Interface, procedure_args::ProcedureArgs};
+use crate::{
+    error::Error,
+    interface::{CallIndex, Interface, ProcedureIndex, WireId},
+    procedure_args::ProcedureArgs,
+};
 use std::{
     io::{Read, Write},
     sync::{Arc, Mutex, RwLock},
@@ -56,7 +60,7 @@ use std::{
 #[derive(Clone)]
 pub struct Wire<'a> {
     /// The unique identifier the attached interface has assigned to this wire.
-    id: usize,
+    id: WireId,
     /// The interface to interact with.
     interface: &'a Interface,
     /// An internal message queue, used for preventing interleaved writing, where part of one message is sent, and then part of another, due
@@ -64,9 +68,9 @@ pub struct Wire<'a> {
     queue: Arc<Mutex<Vec<Vec<u8>>>>,
     /// A map that keeps track of how many times each remote procedure has been called, allowing call indices to be intelligently
     /// and largely internally handled.
-    remote_call_counter: Arc<DashMap<usize, usize>>,
+    remote_call_counter: Arc<DashMap<ProcedureIndex, usize>>,
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed.
-    response_idx_map: Arc<DashMap<(usize, usize), usize>>,
+    response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), usize>>,
     /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
     ///
     /// This is protected by an [`RwLock`] because it is much more common to read from it than to write to it, and this should offer better
@@ -130,7 +134,7 @@ impl<'a> Wire<'a> {
     /// sending one argument at a time, or similar piecemeal use-cases.
     pub fn call(
         &self,
-        procedure_idx: usize,
+        procedure_idx: ProcedureIndex,
         args: impl ProcedureArgs,
     ) -> Result<CallHandle, Error> {
         if self.is_terminated() {
@@ -152,9 +156,9 @@ impl<'a> Wire<'a> {
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
     pub fn start_call_with_partial_args(
         &self,
-        procedure_idx: usize,
+        procedure_idx: ProcedureIndex,
         args: impl ProcedureArgs,
-    ) -> Result<usize, Error> {
+    ) -> Result<CallIndex, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -168,9 +172,9 @@ impl<'a> Wire<'a> {
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
     pub fn start_call_with_partial_bytes(
         &self,
-        procedure_idx: usize,
+        procedure_idx: ProcedureIndex,
         args: &[u8],
-    ) -> Result<usize, Error> {
+    ) -> Result<CallIndex, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -185,11 +189,11 @@ impl<'a> Wire<'a> {
                 // We need to update what's in there
                 let new_call_idx = *last_call_idx + 1;
                 *last_call_idx = new_call_idx;
-                new_call_idx
+                CallIndex(new_call_idx)
             } else {
                 // We need to insert a new entry
                 self.remote_call_counter.insert(procedure_idx, 0);
-                0
+                CallIndex(0)
             };
         // Allocate a new message buffer on the interface that we'll receive the response into
         let response_idx = self.interface.push();
@@ -209,7 +213,11 @@ impl<'a> Wire<'a> {
     /// and be sure to follow the above guidance on this! (I.e. you must not include the length marker.)
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
-    pub fn call_with_bytes(&self, procedure_idx: usize, args: &[u8]) -> Result<CallHandle, Error> {
+    pub fn call_with_bytes(
+        &self,
+        procedure_idx: ProcedureIndex,
+        args: &[u8],
+    ) -> Result<CallHandle, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -222,11 +230,11 @@ impl<'a> Wire<'a> {
                 // We need to update what's in there
                 let new_call_idx = *last_call_idx + 1;
                 *last_call_idx = new_call_idx;
-                new_call_idx
+                CallIndex(new_call_idx)
             } else {
                 // We need to insert a new entry
                 self.remote_call_counter.insert(procedure_idx, 0);
-                0
+                CallIndex(0)
             };
         // Allocate a new message buffer on the interface that we'll receive the response into
         let response_idx = self.interface.push();
@@ -268,8 +276,8 @@ impl<'a> Wire<'a> {
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
     pub fn continue_given_call_with_args(
         &self,
-        procedure_idx: usize,
-        call_idx: usize,
+        procedure_idx: ProcedureIndex,
+        call_idx: CallIndex,
         args: impl ProcedureArgs,
     ) -> Result<(), Error> {
         if self.is_terminated() {
@@ -284,8 +292,8 @@ impl<'a> Wire<'a> {
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
     pub fn continue_given_call_with_bytes(
         &self,
-        procedure_idx: usize,
-        call_idx: usize,
+        procedure_idx: ProcedureIndex,
+        call_idx: CallIndex,
         args: &[u8],
     ) -> Result<(), Error> {
         if self.is_terminated() {
@@ -318,8 +326,8 @@ impl<'a> Wire<'a> {
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
     pub fn end_given_call(
         &self,
-        procedure_idx: usize,
-        call_idx: usize,
+        procedure_idx: ProcedureIndex,
+        call_idx: CallIndex,
     ) -> Result<CallHandle, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
@@ -346,7 +354,11 @@ impl<'a> Wire<'a> {
     /// Gets the local response buffer index for the given procedure and call indices. If no such buffer has been allocated,
     /// this will return an error.
     #[inline]
-    fn get_response_idx(&self, procedure_idx: usize, call_idx: usize) -> Result<usize, Error> {
+    fn get_response_idx(
+        &self,
+        procedure_idx: ProcedureIndex,
+        call_idx: CallIndex,
+    ) -> Result<usize, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -355,8 +367,8 @@ impl<'a> Wire<'a> {
             .get(&(procedure_idx, call_idx))
             .map(|x| x.clone())
             .ok_or(Error::NoResponseBuffer {
-                index: procedure_idx,
-                call_idx,
+                index: procedure_idx.0,
+                call_idx: call_idx.0,
             })
     }
 
@@ -431,12 +443,12 @@ impl<'a> Wire<'a> {
                 // First is the procedure index
                 let mut procedure_buf = [0u8; 4];
                 reader.read_exact(&mut procedure_buf)?;
-                let procedure_idx = u32::from_le_bytes(procedure_buf) as usize;
+                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf) as usize);
 
                 // Second is the call index
                 let mut call_buf = [0u8; 4];
                 reader.read_exact(&mut call_buf)?;
-                let call_idx = u32::from_le_bytes(call_buf) as usize;
+                let call_idx = CallIndex(u32::from_le_bytes(call_buf) as usize);
 
                 // Third is the message index *on the caller* we'll send the response to
                 let mut response_buf = [0u8; 4];
@@ -640,9 +652,9 @@ enum Message<'b> {
     Termination,
     /// A message that calls a procedure. This, like any other message, may have a partial payload.
     Call {
-        procedure_idx: usize, // Remote
-        call_idx: usize,      // Remote
-        response_idx: usize,  // Local
+        procedure_idx: ProcedureIndex, // Remote
+        call_idx: CallIndex,           // Remote
+        response_idx: usize,           // Local
 
         args: &'b [u8],
     },
@@ -708,10 +720,10 @@ impl<'b> Message<'b> {
             } => {
                 buf.write_all(&[1])?;
                 // Step 1
-                let procedure_idx = (*procedure_idx as u32).to_le_bytes();
+                let procedure_idx = (procedure_idx.0 as u32).to_le_bytes();
                 buf.write_all(&procedure_idx)?;
                 // Step 2
-                let call_idx = (*call_idx as u32).to_le_bytes();
+                let call_idx = (call_idx.0 as u32).to_le_bytes();
                 buf.write_all(&call_idx)?;
                 // Step 3
                 let response_idx = (*response_idx as u32).to_le_bytes();
@@ -754,7 +766,7 @@ impl<'b> Message<'b> {
 #[cfg(test)]
 mod tests {
     use super::Wire;
-    use crate::Interface;
+    use crate::{Interface, ProcedureIndex};
     use std::io::Cursor;
 
     struct Actor {
@@ -861,7 +873,7 @@ mod tests {
         let mut module = Actor::new();
 
         host.interface.add_procedure(0, procedure);
-        let handle = module.wire.call(0, ());
+        let handle = module.wire.call(ProcedureIndex::new(0), ());
         assert!(handle.is_ok());
         let handle = handle.unwrap();
         assert!(module.wire.flush(&mut host.input).is_ok());

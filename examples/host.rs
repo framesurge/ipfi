@@ -1,4 +1,4 @@
-use ipfi::{Interface, Wire};
+use ipfi::{Interface, ProcedureIndex, Wire};
 use once_cell::sync::Lazy;
 use std::process::{Command, Stdio};
 
@@ -50,7 +50,7 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_secs(1));
     wire.send_full_message(&"Doe".to_string(), 1).unwrap();
 
-    let greeting_handle = wire.call(0, ()).unwrap();
+    let greeting_handle = wire.call(ProcedureIndex::new(0), ()).unwrap();
 
     // If we're deaing with a single-threaded remote program that reads all its input at once, we have to tell it
     // when we're done, which would require either dropping `child.stdin` here (impossible because the wire has

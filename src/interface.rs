@@ -3,6 +3,26 @@ use dashmap::DashMap;
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::{Mutex, RwLock};
 
+// The following are newtype wrappers that can deliberately only be constructed internally to avoid confusion.
+/// A call index. This is its own type to avoid confusion.
+///
+/// For information about call indices, see [`Wire`].
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct CallIndex(pub(crate) usize);
+/// A procedure index. This is its own type to avoid confusion.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct ProcedureIndex(pub(crate) usize);
+// Users need to be able to construct these manually
+impl ProcedureIndex {
+    /// Creates a new procedure index as given.
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+}
+/// An identifier for a wire.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct WireId(pub(crate) usize);
+
 /// A procedure registered on an interface.
 pub struct Procedure {
     /// The closure that will be called, which uses pure bytes as an interface. If there is a failure to
@@ -35,7 +55,7 @@ pub struct Interface {
     creation_locks: DashMap<usize, CompleteLock>,
     /// A list of procedures registered on this interface that those communicating with this
     /// program may execute.
-    procedures: DashMap<usize, Procedure>,
+    procedures: DashMap<ProcedureIndex, Procedure>,
     /// A map of procedure call indices and the wire IDs that produced them to local message buffer addresses.
     /// These are necessary because, when a program sends a partial procedure call, and then later completes it,
     /// we need to know that the two messages are part of the same call. On their side, the caller will maintain
@@ -43,7 +63,7 @@ pub struct Interface {
     /// as necessary.
     ///
     /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
-    call_to_buffer_map: DashMap<(usize, usize, usize), usize>,
+    call_to_buffer_map: DashMap<(ProcedureIndex, CallIndex, WireId), usize>,
     /// The unique numerical identifier that will be used for the next wire that connects to this interface.
     /// We map call indices to message buffers, but, since one interface can be used to connect to many wires,
     /// call indices are likely to overlap, so every wire must have a unique identifier. Instead of pulling
@@ -70,11 +90,11 @@ impl Interface {
     /// Gets an ID for a wire or other communication primitive that will depend on this interface. Any IPC primitive
     /// that will call procedures should acquire one of these for itself to make sure its procedure calls do not overlap
     /// with those of other wires. Typically, this will be called internally by the [`crate::Wire`] type.
-    pub fn get_id(&self) -> usize {
+    pub fn get_id(&self) -> WireId {
         let mut next_next_wire_id = self.next_wire_id.lock().unwrap();
         let next_wire_id = *next_next_wire_id;
         *next_next_wire_id += 1;
-        next_wire_id
+        WireId(next_wire_id)
     }
     /// Adds the given function as a procedure on this interface, which will allow other programs interacting with
     /// this one to execute it. Critically, no validation of intent or origin is requires to remotely execute procedures
@@ -120,7 +140,7 @@ impl Interface {
             Ok(ret)
         });
         let procedure = Procedure { closure };
-        self.procedures.insert(idx, procedure);
+        self.procedures.insert(ProcedureIndex(idx), procedure);
     }
     /// Calls the procedure with the given index, returning the raw serialized byte vector it produces. This will get its
     /// argument information from the given internal message buffer index, which it expects to be completed. This method
@@ -130,9 +150,9 @@ impl Interface {
     /// remote communicators.
     pub fn call_procedure(
         &self,
-        procedure_idx: usize,
-        call_idx: usize,
-        wire_id: usize,
+        procedure_idx: ProcedureIndex,
+        call_idx: CallIndex,
+        wire_id: WireId,
     ) -> Result<Vec<u8>, Error> {
         // Get the buffer where the arguments are supposed to be, and then delete that mapping to free up some space
         let args_buf_idx = self.get_call_buffer(procedure_idx, call_idx, wire_id);
@@ -157,7 +177,7 @@ impl Interface {
             }
         } else {
             Err(Error::NoSuchProcedure {
-                index: procedure_idx,
+                index: procedure_idx.0,
             })
         }
     }
@@ -165,7 +185,12 @@ impl Interface {
     /// This allows arguments to be accumulated piecemeal before the actual procedure call.
     ///
     /// This will create a buffer for this call if one doesn't already exist, and otherwise it will create one.
-    pub fn get_call_buffer(&self, procedure_idx: usize, call_idx: usize, wire_id: usize) -> usize {
+    pub(crate) fn get_call_buffer(
+        &self,
+        procedure_idx: ProcedureIndex,
+        call_idx: CallIndex,
+        wire_id: WireId,
+    ) -> usize {
         let buf_idx = if let Some(buf_idx) =
             self.call_to_buffer_map
                 .get(&(procedure_idx, call_idx, wire_id))
@@ -344,19 +369,24 @@ impl Interface {
                 messages = self.messages.read().unwrap();
                 messages.get(message_idx).unwrap()
             };
+            // Cheap clone
             message.1.clone()
         };
 
         message_lock.wait_for_completion();
 
-        let messages = self.messages.read().unwrap();
-        messages[message_idx].0.to_vec()
+        let mut messages = self.messages.write().unwrap();
+        let (message, _complete_lock) = std::mem::replace(
+            messages.get_mut(message_idx).unwrap(),
+            (Vec::new(), CompleteLock::new()),
+        );
+        message
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Interface;
+    use super::*;
 
     fn has_duplicates<T: Eq + std::hash::Hash>(vec: &[T]) -> bool {
         let mut set = std::collections::HashSet::new();
@@ -376,10 +406,18 @@ mod tests {
     #[test]
     fn call_buffers_should_be_distinct() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 0));
-        let buf_2 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 1));
-        let buf_3 = std::thread::spawn(|| interface.get_call_buffer(0, 1, 0));
-        let buf_4 = std::thread::spawn(|| interface.get_call_buffer(1, 0, 0));
+        let buf_1 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
+        });
+        let buf_2 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
+        });
+        let buf_3 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(0), CallIndex(1), WireId(0))
+        });
+        let buf_4 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(1), CallIndex(0), WireId(0))
+        });
 
         assert!(!has_duplicates(&[
             buf_1.join().unwrap(),
@@ -391,10 +429,18 @@ mod tests {
     #[test]
     fn call_buffers_should_be_reused() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 0));
-        let buf_2 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 1));
-        let buf_3 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 0));
-        let buf_4 = std::thread::spawn(|| interface.get_call_buffer(0, 0, 1));
+        let buf_1 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
+        });
+        let buf_2 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
+        });
+        let buf_3 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
+        });
+        let buf_4 = std::thread::spawn(|| {
+            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
+        });
 
         let buf_1 = buf_1.join().unwrap();
         let buf_2 = buf_2.join().unwrap();
