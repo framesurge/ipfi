@@ -33,7 +33,7 @@ fn main() {
     wire.fill(&mut std::io::stdin()).unwrap();
 
     // We can also call a function on the host
-    let msg_send_handle = wire
+    let _ = wire
         .call(ProcedureIndex::new(0), ("Thanks very much!".to_string(),))
         .unwrap();
     // Calling procedures involves first sending a call message, and then waiting for a response message,

@@ -1,6 +1,6 @@
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::de::DeserializeOwned;
 
 use crate::{
     error::Error,
@@ -377,54 +377,6 @@ impl<'a> Wire<'a> {
             })
     }
 
-    /// Sends the given raw bytes over the wire, with the given message index, which will correspond to that index in the
-    /// interface the other side maintains (it has no relation to our own interface!).
-    ///
-    /// This will not send a termination signal.
-    pub fn send_bytes(&self, bytes: &[u8], message_idx: usize) -> Result<(), Error> {
-        if self.is_terminated() {
-            return Err(Error::WireTerminated);
-        }
-
-        let msg = Message::General {
-            message_idx,
-            message: bytes,
-        };
-        let bytes = msg.to_bytes()?;
-        self.queue.push(bytes);
-
-        Ok(())
-    }
-    /// Sends the given full message over the wire to the given remote message buffer index.
-    pub fn send_full_message<T: Serialize>(
-        &self,
-        msg: &T,
-        message_idx: usize,
-    ) -> Result<(), Error> {
-        if self.is_terminated() {
-            return Err(Error::WireTerminated);
-        }
-
-        let bytes = rmp_serde::to_vec(msg)?;
-        self.send_bytes(&bytes, message_idx)?;
-        self.end_message(message_idx)
-    }
-    /// Sends a termination signal over the wire for the given message index. After this is called, further bytes will
-    /// not be able to be sent for this message.
-    pub fn end_message(&self, message_idx: usize) -> Result<(), Error> {
-        if self.is_terminated() {
-            return Err(Error::WireTerminated);
-        }
-
-        let msg = Message::General {
-            message_idx,
-            message: &[],
-        };
-        let bytes = msg.to_bytes()?;
-        self.queue.push(bytes);
-
-        Ok(())
-    }
     /// Receives a single message from the given reader, sending it into the interface as appropriate. This contains
     /// the core logic that handles messages, partial procedure calls, etc.
     ///
@@ -638,6 +590,7 @@ impl Drop for Wire<'_> {
 /// requires `.flush()` to be called, so waiting inside a function like `.call()` would make very little sense.
 // There is no point in making this `Clone` to avoid issues around dropping the wire, as the `'a` lifetime is what gets in
 // the way
+#[must_use]
 pub struct CallHandle<'a> {
     /// The message index to wait for. If this is improperly initialised, we will probably get completely different and almost
     /// certainly invalid data.
@@ -833,81 +786,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn message_should_be_propagated_to_interface() {
-        let host = Actor::new();
-        let mut module = Actor::new();
+    // #[test]
+    // fn message_should_be_propagated_to_interface() {
+    //     let host = Actor::new();
+    //     let mut module = Actor::new();
 
-        // Test writing a general message and everything associated therewith
-        assert!(host
-            .wire
-            .send_full_message(&"Hello, world!".to_string(), 0)
-            .is_ok());
-        // Test writing it to an output buffer
-        assert!(host.wire.flush(&mut module.input).is_ok());
-        // We should receive the message, and then a terminator
-        module.reset_input();
-        for _ in 0..2 {
-            // Test receiving system
-            assert!(module.wire.receive_one(&mut module.input).is_ok());
-        }
+    //     // Test writing a general message and everything associated therewith
+    //     assert!(host
+    //         .wire
+    //         .send_full_message(&"Hello, world!".to_string(), 0)
+    //         .is_ok());
+    //     // Test writing it to an output buffer
+    //     assert!(host.wire.flush(&mut module.input).is_ok());
+    //     // We should receive the message, and then a terminator
+    //     module.reset_input();
+    //     for _ in 0..2 {
+    //         // Test receiving system
+    //         assert!(module.wire.receive_one(&mut module.input).is_ok());
+    //     }
 
-        // The message should have been passed to the interface
-        let msg = module.interface.get::<String>(0);
-        assert!(msg.is_ok());
-        assert_eq!(msg.unwrap(), "Hello, world!");
-    }
-    #[test]
-    fn partial_message_should_work() {
-        let host = Actor::new();
-        let mut module = Actor::new();
+    //     // The message should have been passed to the interface
+    //     let msg = module.interface.get::<String>(0);
+    //     assert!(msg.is_ok());
+    //     assert_eq!(msg.unwrap(), "Hello, world!");
+    // }
+    // #[test]
+    // fn partial_message_should_work() {
+    //     let host = Actor::new();
+    //     let mut module = Actor::new();
 
-        let msg = rmp_serde::encode::to_vec("Hello, world!").unwrap();
-        let first_partial = &msg[0..5];
-        let second_partial = &msg[5..10];
-        let third_partial = &msg[10..];
+    //     let msg = rmp_serde::encode::to_vec("Hello, world!").unwrap();
+    //     let first_partial = &msg[0..5];
+    //     let second_partial = &msg[5..10];
+    //     let third_partial = &msg[10..];
 
-        assert!(host.wire.send_bytes(first_partial, 0).is_ok());
-        assert!(host.wire.send_bytes(second_partial, 0).is_ok());
-        assert!(host.wire.send_bytes(third_partial, 0).is_ok());
-        assert!(host.wire.end_message(0).is_ok());
+    //     assert!(host.wire.send_bytes(first_partial, 0).is_ok());
+    //     assert!(host.wire.send_bytes(second_partial, 0).is_ok());
+    //     assert!(host.wire.send_bytes(third_partial, 0).is_ok());
+    //     assert!(host.wire.end_message(0).is_ok());
 
-        assert!(host.wire.flush(&mut module.input).is_ok());
-        module.reset_input();
-        // First, second, third, end
-        for _ in 0..4 {
-            assert!(module.wire.receive_one(&mut module.input).is_ok());
-        }
+    //     assert!(host.wire.flush(&mut module.input).is_ok());
+    //     module.reset_input();
+    //     // First, second, third, end
+    //     for _ in 0..4 {
+    //         assert!(module.wire.receive_one(&mut module.input).is_ok());
+    //     }
 
-        let msg = module.interface.get::<String>(0);
-        assert!(msg.is_ok());
-        assert_eq!(msg.unwrap(), "Hello, world!");
-    }
-    #[test]
-    fn spurious_reconstitution_should_fail() {
-        let host = Actor::new();
-        let mut module = Actor::new();
+    //     let msg = module.interface.get::<String>(0);
+    //     assert!(msg.is_ok());
+    //     assert_eq!(msg.unwrap(), "Hello, world!");
+    // }
+    // #[test]
+    // fn spurious_reconstitution_should_fail() {
+    //     let host = Actor::new();
+    //     let mut module = Actor::new();
 
-        let msg = rmp_serde::encode::to_vec("Hello, world!").unwrap();
-        let first_partial = &msg[0..5];
-        let second_partial = &msg[5..10];
+    //     let msg = rmp_serde::encode::to_vec("Hello, world!").unwrap();
+    //     let first_partial = &msg[0..5];
+    //     let second_partial = &msg[5..10];
 
-        assert!(host.wire.send_bytes(first_partial, 0).is_ok());
-        assert!(host.wire.send_bytes(second_partial, 0).is_ok());
+    //     assert!(host.wire.send_bytes(first_partial, 0).is_ok());
+    //     assert!(host.wire.send_bytes(second_partial, 0).is_ok());
 
-        // Try a premature termination and make sure the message can't be spuriously reconstituted
-        assert!(host.wire.end_message(0).is_ok());
+    //     // Try a premature termination and make sure the message can't be spuriously reconstituted
+    //     assert!(host.wire.end_message(0).is_ok());
 
-        assert!(host.wire.flush(&mut module.input).is_ok());
-        module.reset_input();
-        // First, second, end
-        for _ in 0..3 {
-            assert!(module.wire.receive_one(&mut module.input).is_ok());
-        }
+    //     assert!(host.wire.flush(&mut module.input).is_ok());
+    //     module.reset_input();
+    //     // First, second, end
+    //     for _ in 0..3 {
+    //         assert!(module.wire.receive_one(&mut module.input).is_ok());
+    //     }
 
-        let msg = module.interface.get::<String>(0);
-        assert!(msg.is_err());
-    }
+    //     let msg = module.interface.get::<String>(0);
+    //     assert!(msg.is_err());
+    // }
     #[test]
     fn no_args_procedure_call_should_work() {
         fn procedure(_: ()) -> u32 {

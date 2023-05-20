@@ -6,4 +6,4 @@ mod roi_queue;
 mod wire;
 
 pub use crate::interface::{CallIndex, Interface, ProcedureIndex, WireId};
-pub use crate::wire::{signal_termination, Wire};
+pub use crate::wire::{signal_termination, AutonomousWireHandle, Wire};
