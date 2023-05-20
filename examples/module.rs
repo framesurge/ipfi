@@ -52,5 +52,7 @@ fn prepare() -> Wire<'static> {
         eprintln!("Got last name from host: {}!", last_name);
     });
 
+    // If we didn't need to call any procedures on the host, this could be `::new_module()` instead to
+    // improve security
     Wire::new(&INTERFACE)
 }

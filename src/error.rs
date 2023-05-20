@@ -30,4 +30,6 @@ pub enum Error {
     WriteLenMarkerFailed,
     #[error("this wire has been terminated from the other side, and operations can no longer be performed")]
     WireTerminated,
+    #[error("attempted to use wire created with `Wire::new_module()` to call a procedure, which is disabled (module-style wires can only respond to procedure calls, not make their own)")]
+    CallFromModule,
 }

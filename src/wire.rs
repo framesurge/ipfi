@@ -68,6 +68,12 @@ pub struct Wire<'a> {
     id: WireId,
     /// The interface to interact with.
     interface: &'a Interface,
+    /// Whether or not this wire was instantiated with support for handling general messages. Wires used in server-like situations, where a client will be
+    /// calling functions from the server, but not the other way around, should generally set this to `true` to eliminate  anunnecessary potential attack
+    /// surface.
+    ///
+    /// When this is set to `true`, function calls will also be disabled on this wire.
+    module_style: bool,
     /// An internal message queue, used for preventing interleaved writing, where part of one message is sent, and then part of another, due
     /// to race conditions. This would be fine if the headers were kept intact, although race conditions are rarely so courteous.
     ///
@@ -110,10 +116,31 @@ impl Wire<'static> {
 impl<'a> Wire<'a> {
     /// Creates a new buffer-based wire to work with the given interface. This takes in the interface to work with and a writeable
     /// buffer to use for termination when this wire is dropped.
+    ///
+    /// # Security
+    ///
+    /// TODO After refactor
     pub fn new(interface: &'a Interface) -> Self {
         Self {
             id: interface.get_id(),
             interface,
+            module_style: false,
+            queue: Arc::new(SegQueue::new()),
+            remote_call_counter: Arc::new(DashMap::new()),
+            response_idx_map: Arc::new(DashMap::new()),
+
+            // If we detect an EOF, this will be set
+            terminated: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    /// Creates a new buffer-based wire to work with the given interface. This is the same as `.new()`, except it disables support for
+    /// general messages, which are unnecessary in some contexts, where they would only present an additional attack surface. If you
+    /// intend for this wire to be used by the remote to call local functions, but not the other way around, you should use this method.
+    pub fn new_module(interface: &'a Interface) -> Self {
+        Self {
+            id: interface.get_id(),
+            interface,
+            module_style: true,
             queue: Arc::new(SegQueue::new()),
             remote_call_counter: Arc::new(DashMap::new()),
             response_idx_map: Arc::new(DashMap::new()),
@@ -144,6 +171,8 @@ impl<'a> Wire<'a> {
     ) -> Result<CallHandle, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
+        } else if self.module_style {
+            return Err(Error::CallFromModule);
         }
 
         let args = args.into_bytes()?;
@@ -166,6 +195,8 @@ impl<'a> Wire<'a> {
     ) -> Result<CallIndex, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
+        } else if self.module_style {
+            return Err(Error::CallFromModule);
         }
 
         let args = args.into_bytes()?;
@@ -182,6 +213,8 @@ impl<'a> Wire<'a> {
     ) -> Result<CallIndex, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
+        } else if self.module_style {
+            return Err(Error::CallFromModule);
         }
 
         if args.is_empty() {
@@ -225,6 +258,8 @@ impl<'a> Wire<'a> {
     ) -> Result<CallHandle, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
+        } else if self.module_style {
+            return Err(Error::CallFromModule);
         }
 
         // We allow zero-length payloads here (for functions with no arguments in particular)
@@ -287,6 +322,8 @@ impl<'a> Wire<'a> {
     ) -> Result<(), Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
+        } else if self.module_style {
+            return Err(Error::CallFromModule);
         }
 
         let args = args.into_bytes()?;
@@ -303,6 +340,8 @@ impl<'a> Wire<'a> {
     ) -> Result<(), Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
+        } else if self.module_style {
+            return Err(Error::CallFromModule);
         }
 
         if args.is_empty() {
@@ -336,6 +375,8 @@ impl<'a> Wire<'a> {
     ) -> Result<CallHandle, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
+        } else if self.module_style {
+            return Err(Error::CallFromModule);
         }
 
         // Get the response index we're using
@@ -460,7 +501,8 @@ impl<'a> Wire<'a> {
                 }
             }
             // General message
-            2 => {
+            // For security, we may ignore these completely
+            2 if !self.module_style => {
                 // First is the message index
                 let mut idx_buf = [0u8; 4];
                 reader.read_exact(&mut idx_buf)?;
