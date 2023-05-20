@@ -13,6 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    thread::JoinHandle,
 };
 
 /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
@@ -92,16 +93,18 @@ impl Wire<'static> {
         &self,
         mut reader: impl Read + Send + Sync + 'static,
         mut writer: impl Write + Send + Sync + 'static,
-    ) {
+    ) -> AutonomousWireHandle {
         let self_reader = self.clone();
-        std::thread::spawn(move || while self_reader.fill(&mut reader).is_ok() {});
+        let reader = std::thread::spawn(move || while self_reader.fill(&mut reader).is_ok() {});
         let self_writer = self.clone();
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             // TODO Spinning...
             while self_writer.flush(&mut writer).is_ok() {
                 std::hint::spin_loop();
             }
         });
+
+        AutonomousWireHandle { reader, writer }
     }
 }
 impl<'a> Wire<'a> {
@@ -605,6 +608,19 @@ impl<'a> Wire<'a> {
 
         Ok(())
     }
+    /// Writes a termination signal to the output, which will permanently neuter this connection, and all further operations on this wire
+    /// will fail.
+    ///
+    /// Generally, [`signal_termination`] should be preferred by single-threaded programs, although multi-threaded programs will typically
+    /// use `.start()`, which takes ownership of the writer that has to be used to signal termination. This method can be combined with
+    /// `.start()` to avoid such pitfalls. In short, use this if you're using `wire.open()` as well, otherwise use [`signal_termination`].
+    pub fn signal_termination(&self) -> Result<(), std::io::Error> {
+        let msg = Message::Termination;
+        let bytes = msg.to_bytes()?;
+        self.queue.push(bytes);
+
+        Ok(())
+    }
     /// Sets the internal termination flag to `true`, causing all subsequent operations to fail.
     fn mark_terminated(&self) {
         // We use `Ordering::Release` to make sure that all subsequent reads see this
@@ -634,6 +650,22 @@ impl<'a> CallHandle<'a> {
     #[inline]
     pub fn wait<T: DeserializeOwned>(&self) -> Result<T, Error> {
         self.interface.get(self.response_idx)
+    }
+}
+
+/// A handle representing the reader/writer threads started by [`Wire::start`].
+pub struct AutonomousWireHandle {
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+}
+impl AutonomousWireHandle {
+    /// Waits for both threads to be done, which will occur once the wire is expressly terminated. Generally, this is not needed
+    /// when communication patterns are predictable, although in host-module scenarios, the module should generally call this
+    /// to wait until the host expressly terminates it.
+    pub fn wait(self) {
+        // We propagate any thread panics to the caller, there shouldn't be any
+        self.reader.join().unwrap();
+        self.writer.join().unwrap();
     }
 }
 

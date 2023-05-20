@@ -180,8 +180,6 @@ impl Interface {
                     let ret = (procedure.closure)(args);
                     // Success, relinquish this message buffer
                     // To do that though, we have to drop anything referencing the map
-                    drop(args);
-                    drop(complete_lock);
                     drop(m);
                     self.pop(args_buf_idx);
                     ret

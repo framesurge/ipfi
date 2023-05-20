@@ -1,66 +1,56 @@
-use ipfi::{Interface, Wire};
+use ipfi::{Interface, ProcedureIndex, Wire};
 use once_cell::sync::Lazy;
 
 /// The interface we hold with the host. This will be initialized when the program starts.
 static INTERFACE: Lazy<Interface> = Lazy::new(|| Interface::new());
 
-// Non-wasm, we have threads
+// Non-Wasm, we have threads
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
-    INTERFACE.add_procedure(0, print_hello);
-    // TODO Make these remote reservations instead
-    INTERFACE.push();
-    INTERFACE.push();
+    let wire = prepare();
 
-    let wire = Wire::new(&INTERFACE);
-    wire.start(std::io::stdin(), std::io::stdout());
+    // Since we're in a multi-threaded environment, we can spawn threads to do our reading and writing for us!
+    let handle = wire.start(std::io::stdin(), std::io::stdout());
 
-    // We expect a few messages from the host: this code will block until the above thread has
-    // read each of them into the interface (which is thread-safe).
-    //
-    // We use threads here to show support for concurrency, there is little practical benefit in
-    // this example.
-    let r1 = std::thread::spawn(|| {
-        let first_name: String = INTERFACE.get(0).unwrap();
-        eprintln!("Got first name from host: {}!", first_name);
-    });
-    let r2 = std::thread::spawn(|| {
-        let last_name: String = INTERFACE.get(1).unwrap();
-        eprintln!("Got last name from host: {}!", last_name);
-    });
-    r1.join().unwrap();
-    r2.join().unwrap();
-
-    // And write a response to the host (remember that the message indices are separated for read and write)
-    wire.send_full_message(&"Thanks very much!".to_string(), 0)
+    // We can also call a function on the host (all-in-one because it's definitely multithreaded)
+    wire.call(ProcedureIndex::new(0), ("Thanks very much!".to_string(),))
+        .unwrap()
+        .wait::<()>()
         .unwrap();
+
+    // Because we're a module, we should wait until the host closes our streams to know we're done. On the
+    // host side, this is done with `wire.signal_termination()` or `ipfi::signal_termination()`.
+    handle.wait();
 }
 
-// Wasm, we have no threads
+// Wasm, no threads
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    INTERFACE.add_procedure(0, print_hello);
-    // TODO Make these remote reservations instead
-    INTERFACE.push();
-    INTERFACE.push();
+    let wire = prepare();
 
-    let wire = Wire::new(&INTERFACE);
-    // We have no threads, so we'll read until the host sends end-of-input
+    // But if we are on Wasm, we don't have threads, so we'll have to manually read all our input at
+    // once (actually this reads until the host sends a special end-of-input message (different from EOF))
     wire.fill(&mut std::io::stdin()).unwrap();
 
-    // We have to read these sequentially in Wasm, hoping the above has gotten the messages to back them,
-    // otherwise this would hang forever
-    let first_name: String = INTERFACE.get(0).unwrap();
-    eprintln!("Got first name from host: {}!", first_name);
-    let last_name: String = INTERFACE.get(1).unwrap();
-    eprintln!("Got last name from host: {}!", last_name);
-
-    // And write a response to the host (remember that the message indices are separated for read and write)
-    wire.send_full_message(&"Thanks very much!".to_string(), 0)
+    // We can also call a function on the host
+    let msg_send_handle = wire
+        .call(ProcedureIndex::new(0), ("Thanks very much!".to_string(),))
         .unwrap();
+    // Calling procedures involves first sending a call message, and then waiting for a response message,
+    // but this function returns nothing, so we don't have to worry about that in this particular case
     wire.flush(&mut std::io::stdout()).unwrap();
 }
 
-fn print_hello(_: ()) {
-    eprintln!("Hey there!");
+fn prepare() -> Wire<'static> {
+    // These are the functions that will be available for the host to call
+    INTERFACE.add_procedure(0, |(): ()| -> u32 { 42 });
+    INTERFACE.add_procedure(1, |(first_name,): (String,)| {
+        // Stdout is captured by the host, so we use stderr here
+        eprintln!("Got first name from host: {}!", first_name);
+    });
+    INTERFACE.add_procedure(2, |(last_name,): (String,)| {
+        eprintln!("Got last name from host: {}!", last_name);
+    });
+
+    Wire::new(&INTERFACE)
 }

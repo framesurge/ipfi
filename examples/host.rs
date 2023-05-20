@@ -17,7 +17,7 @@ fn main() {
     //
     // The weird parts of this just allow this example to execute the module as Wasm
     // or not
-    let mut child = Command::new(if wasm { "wasmtime" } else { module_path })
+    let mut module = Command::new(if wasm { "wasmtime" } else { module_path })
         // Needed for `wasmtime`, irrelevant for non-Wasm
         .arg(module_path)
         // Pipe stdio so we control it
@@ -27,45 +27,56 @@ fn main() {
         .spawn()
         .expect("failed to spawn module");
 
-    // Allocate our first buffer for the message we'll get later from the module (this makes that number predictable,
-    // as method calls will allocate buffers autonomously)
-    INTERFACE.push();
+    // The module will be able to call this function
+    INTERFACE.add_procedure(0, |(msg,): (String,)| {
+        println!("(From module:) {}", msg);
+    });
 
     // The interface is the core communication type, but the wire is what establishes the actual link between
     // the module and the host
     let wire = Wire::new(&INTERFACE);
     // When we have a `'static` reference to the interface, we can automatically spawn threads to handle reading
     // and writing for us, making this simpler and more ergonomic
-    wire.start(child.stdout.take().unwrap(), child.stdin.take().unwrap());
+    wire.start(module.stdout.take().unwrap(), module.stdin.take().unwrap());
 
-    // IPFI is based on message buffers, which can be written to arbitrarily for as long as you like. Here,
-    // we're writing to two separate buffers, and we're writing the entire message at once, which means we'll
-    // write and then close the buffer. Once a buffer has been closed, no more data can be written to it.
-    // Internally, our interface will retain nothing about these messages after it has written them.
-    wire.send_full_message(&"John".to_string(), 0).unwrap();
-    // That message will now be in a queue and will be sent autonomously, so let's wait a moment for this
-    // next one to show how the module will block.
-    //
-    // If you run this example with Wasm, everything will be delayed, because we have to perform all reads at once.
+    // IPFI is based on procedure calls, so we'll call some from the module now
+    let first_name_handle = wire
+        .call(ProcedureIndex::new(1), ("John".to_string(),))
+        .unwrap();
+    // We wait here to show how Wasm is different to non-Wasm in terms of response grouping, purely for educational
+    // purposes
     std::thread::sleep(std::time::Duration::from_secs(1));
-    wire.send_full_message(&"Doe".to_string(), 1).unwrap();
+    let last_name_handle = wire
+        .call(ProcedureIndex::new(2), ("Doe".to_string(),))
+        .unwrap();
 
-    let greeting_handle = wire.call(ProcedureIndex::new(0), ()).unwrap();
+    // This procedure takes no arguments at all
+    let magic_number_handle = wire.call(ProcedureIndex::new(0), ()).unwrap();
 
     // If we're deaing with a single-threaded remote program that reads all its input at once, we have to tell it
-    // when we're done, which would require either dropping `child.stdin` here (impossible because the wire has
+    // when we're done, which would require either dropping `module.stdin` here (impossible because the wire has
     // taken ownership) or or sending some kind of manual EOF-like signal. This is the latter, and can be used
     // to manually break out of read loops on the client-side. See the method docs for further details.
     if wasm {
         wire.signal_end_of_input().unwrap();
     }
 
-    let _: () = greeting_handle.wait().unwrap();
+    // Now we can wait on all those handles. If we were communicating with a multi-threaded program, we
+    // could wait on them as we make the calls (i.e. `.call(..).unwrap().wait::<()>().unwrap()`).
+    let _: () = first_name_handle.wait().unwrap();
+    let _: () = last_name_handle.wait().unwrap();
+    let magic_number: u32 = magic_number_handle.wait().unwrap();
 
-    // Now we're using that buffer we pre-allocated earlier
-    let msg_from_child: String = INTERFACE.get(0).unwrap();
-    println!("(From module:) {}", msg_from_child);
+    println!("Magic number was {}!", magic_number);
+
+    // Wasm will automatically finish when it's done, but the multi-threaded non-Wasm module will hang around
+    // waiting for further messages, so we'll explicitly signal a termination
+    if !wasm {
+        // We could have done this with `ipfi::signal_termination()` if we could get the module's stdin back, but
+        // we can't, which is why this method exists
+        wire.signal_termination().unwrap();
+    }
 
     // Wait for the module to finish so we don't leave it hanging around
-    let _ = child.wait();
+    let _ = module.wait();
 }
