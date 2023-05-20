@@ -1,12 +1,13 @@
-use crossbeam_queue::SegQueue;
-use dashmap::DashMap;
-use serde::de::DeserializeOwned;
-
+#[cfg(feature = "serde")]
+use crate::procedure_args::ProcedureArgs;
 use crate::{
     error::Error,
     interface::{CallIndex, Interface, ProcedureIndex, WireId},
-    procedure_args::ProcedureArgs,
 };
+use crossbeam_queue::SegQueue;
+use dashmap::DashMap;
+#[cfg(feature = "serde")]
+use serde::de::DeserializeOwned;
 use std::{
     io::{Read, Write},
     sync::{
@@ -164,6 +165,7 @@ impl<'a> Wire<'a> {
     ///
     /// Generally, this should be preferred as a high-level method, although several lower-level methods are available for
     /// sending one argument at a time, or similar piecemeal use-cases.
+    #[cfg(feature = "serde")]
     pub fn call(
         &self,
         procedure_idx: ProcedureIndex,
@@ -188,6 +190,7 @@ impl<'a> Wire<'a> {
     /// of the local message buffer where the response is held will be returned when the call is completed.
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
+    #[cfg(feature = "serde")]
     pub fn start_call_with_partial_args(
         &self,
         procedure_idx: ProcedureIndex,
@@ -314,6 +317,7 @@ impl<'a> Wire<'a> {
     /// For an explanation of how call indices work, see [`Wire`].
     ///
     /// This is one of several low-level procedure calling methods, and you probably want to use `.call()` instead.
+    #[cfg(feature = "serde")]
     pub fn continue_given_call_with_args(
         &self,
         procedure_idx: ProcedureIndex,
@@ -642,9 +646,15 @@ pub struct CallHandle<'a> {
 }
 impl<'a> CallHandle<'a> {
     /// Waits for the procedure call to complete and returns the result. This will block.
+    #[cfg(feature = "serde")]
     #[inline]
     pub fn wait<T: DeserializeOwned>(&self) -> Result<T, Error> {
         self.interface.get(self.response_idx)
+    }
+    /// Same as `.wait()`, but this works directly with bytes.
+    #[inline]
+    pub fn wait_bytes(&self) -> Vec<u8> {
+        self.interface.get_raw(self.response_idx)
     }
 }
 
@@ -903,6 +913,7 @@ mod tests {
     //     let msg = module.interface.get::<String>(0);
     //     assert!(msg.is_err());
     // }
+    #[cfg(feature = "serde")]
     #[test]
     fn no_args_procedure_call_should_work() {
         fn procedure(_: ()) -> u32 {

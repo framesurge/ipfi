@@ -2,8 +2,10 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[cfg(feature = "serde")]
     #[error(transparent)]
     Encode(#[from] rmp_serde::encode::Error),
+    #[cfg(feature = "serde")]
     #[error(transparent)]
     Decode(#[from] rmp_serde::decode::Error),
     #[error("the message at local index {index} has already been marked as completed (no further data may be sent to it)")]

@@ -1,7 +1,8 @@
-use crate::{
-    complete_lock::CompleteLock, error::Error, procedure_args::Tuple, roi_queue::RoiQueue,
-};
+#[cfg(feature = "serde")]
+use crate::procedure_args::Tuple;
+use crate::{complete_lock::CompleteLock, error::Error, roi_queue::RoiQueue};
 use dashmap::DashMap;
+#[cfg(feature = "serde")]
 use serde::{de::DeserializeOwned, Serialize};
 
 // The following are newtype wrappers that can deliberately only be constructed internally to avoid confusion.
@@ -124,6 +125,7 @@ impl Interface {
     /// within the procedure itself, otherwise any program could use IPFI to pass invalid integers. Alternately, you can use a custom
     /// serialization/deserialization process to uphold invariants, provided you are satisfied that is secure against totally untrusted
     /// input.
+    #[cfg(feature = "serde")]
     pub fn add_procedure<
         A: Serialize + DeserializeOwned + Tuple,
         R: Serialize + DeserializeOwned,
@@ -153,6 +155,21 @@ impl Interface {
             Ok(ret)
         });
         let procedure = Procedure { closure };
+        self.procedures.insert(ProcedureIndex(idx), procedure);
+    }
+    /// Same as `.add_procedure()`, but this accepts procedures that work directly with raw bytes, involving no serialization or deserialization
+    /// process. This method is only recommended when the `serde` feature cannot be used for whatever reason, as it requires you to carefully manage
+    /// byte streams yourself, as there will be absolutely no validity checking of them by IPFI. Unlike `.add_procedure()`, this will accept any
+    /// bytes and pass them straight to you, performing no intermediary steps.
+    pub fn add_raw_procedure(
+        &self,
+        idx: usize,
+        f: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
+    ) {
+        // We only need to wrap the result in `Ok(..)`
+        let procedure = Procedure {
+            closure: Box::new(move |data: &[u8]| Ok(f(data))),
+        };
         self.procedures.insert(ProcedureIndex(idx), procedure);
     }
     /// Calls the procedure with the given index, returning the raw serialized byte vector it produces. This will get its
@@ -314,6 +331,7 @@ impl Interface {
     /// Note that this method will extract the underlying message from the given buffer index, leaving it
     /// available for future messages or procedure call metadata. This means that requesting the same message
     /// index may yield completely different data.
+    #[cfg(feature = "serde")]
     pub fn get<T: DeserializeOwned>(&self, message: usize) -> Result<T, Error> {
         let message = self.get_raw(message);
         let decoded = rmp_serde::decode::from_slice(&message)?;
@@ -484,6 +502,7 @@ mod tests {
         assert!(interface.send(0, 3).is_err());
     }
     #[test]
+    #[cfg(feature = "serde")]
     fn get_should_work() {
         let interface = Interface::new();
         interface.send(42, 0).unwrap();
@@ -495,6 +514,7 @@ mod tests {
         assert_eq!(msg.unwrap(), 42);
     }
     #[test]
+    #[cfg(feature = "serde")]
     fn get_with_wrong_type_should_fail() {
         let interface = Interface::new();
         interface.send(42, 0).unwrap();
@@ -505,6 +525,7 @@ mod tests {
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
+    #[cfg(feature = "serde")]
     fn concurrent_get_should_resolve() {
         let interface = Box::leak(Box::new(Interface::new()));
 
