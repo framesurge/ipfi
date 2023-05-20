@@ -227,9 +227,6 @@ impl Interface {
     }
     /// Allocates space for a new message buffer, creating a new completion lock.
     /// This will also mark a relevant creation lock as completed if one exists.
-    ///
-    /// The caller must ensure that both the messages and creation locks are accessible
-    /// when this function is called, or a deadlock will ensue.
     pub fn push(&self) -> usize {
         let new_id = self.message_id_queue.get();
         self.messages
@@ -278,7 +275,6 @@ impl Interface {
                 Ok(true)
             }
         } else {
-            // TODO What should we do here?
             Err(Error::OutOfBounds { index: message_id })
         }
     }
@@ -295,7 +291,6 @@ impl Interface {
                 Ok(())
             }
         } else {
-            // TODO What should we do here?
             Err(Error::OutOfBounds { index: message_id })
         }
     }
@@ -311,7 +306,6 @@ impl Interface {
                 Ok(())
             }
         } else {
-            // TODO What should we do here?
             Err(Error::OutOfBounds { index: message_id })
         }
     }
