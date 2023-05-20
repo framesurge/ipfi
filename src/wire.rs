@@ -303,25 +303,19 @@ impl<'a> Wire<'a> {
             procedure_idx,
             call_idx,
             args,
+            // We can terminate in one go here
+            terminator: true,
         };
         // Convert that message into bytes and place it in the queue
         let bytes = msg.to_bytes()?;
         self.queue.push(bytes);
 
-        // And neither does this
-        // Only write an explicit termination message if we had arguments though, otherwise that would become
-        // superfluous and we'd get a double-call by accident! This can cause extremely weird behaviour.
-        if !args.is_empty() {
-            self.end_given_call(procedure_idx, call_idx)
-        } else {
-            // Get the response index we're using
-            let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
-
-            Ok(CallHandle {
-                response_idx,
-                interface: self.interface,
-            })
-        }
+        // Get the response index we're using
+        let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+        Ok(CallHandle {
+            response_idx,
+            interface: self.interface,
+        })
     }
     /// Continues the procedure call with the given remote procedure index and call index by sending the given arguments.
     /// This will not terminate the message, and will leave it open for calling.
@@ -369,6 +363,7 @@ impl<'a> Wire<'a> {
             procedure_idx,
             call_idx,
             args,
+            terminator: false,
         };
         // Convert that message into bytes and place it in the queue
         let bytes = msg.to_bytes()?;
@@ -397,6 +392,7 @@ impl<'a> Wire<'a> {
             procedure_idx,
             call_idx,
             args: &[],
+            terminator: true,
         };
         // Convert that message into bytes and place it in the queue
         let bytes = msg.to_bytes()?;
@@ -460,6 +456,11 @@ impl<'a> Wire<'a> {
                 reader.read_exact(&mut call_buf)?;
                 let call_idx = CallIndex(u32::from_le_bytes(call_buf));
 
+                // Third is whether or not this is the last message in its series
+                let mut terminator_buf = [0u8; 1];
+                reader.read_exact(&mut terminator_buf)?;
+                let is_final = terminator_buf[0] != 0;
+
                 // Then the number of bytes to expect
                 let mut len_buf = [0u8; 4];
                 reader.read_exact(&mut len_buf)?;
@@ -470,9 +471,14 @@ impl<'a> Wire<'a> {
                     .interface
                     .get_call_buffer(procedure_idx, call_idx, self.id);
 
-                // If there were no arguments, we should call the procedure (we either allegedly have everything, or
-                // the procedure takes no arguments in the first place)
-                if num_bytes == 0 {
+                let mut bytes = vec![0u8; num_bytes as usize];
+                reader.read_exact(&mut bytes)?;
+                // This will accumulate argument bytes over potentially many continuations in the local call buffer
+                self.interface.send_many(&bytes, call_buf_idx)?;
+
+                // If this message was the last in its series, we should call the procedure, assuming we have all the arguments
+                // we need
+                if is_final {
                     self.interface.terminate_message(call_buf_idx)?;
 
                     // This will actually execute!
@@ -484,28 +490,12 @@ impl<'a> Wire<'a> {
                         procedure_idx,
                         call_idx,
                         message: &ret,
+                        terminator: true,
                     };
                     let ret_msg_bytes = ret_msg.to_bytes()?;
                     self.queue.push(ret_msg_bytes);
-                    // And now we need to terminate that result message
-                    self.queue.push(
-                        Message::Response {
-                            procedure_idx,
-                            call_idx,
-                            message: &[],
-                        }
-                        .to_bytes()?,
-                    );
                     Ok(Some(true))
                 } else {
-                    // We're continuing or starting a new partial procedure argument addition, so get a local message
-                    // buffer for it if there isn't already one
-
-                    let mut bytes = vec![0u8; num_bytes as usize];
-                    reader.read_exact(&mut bytes)?;
-
-                    // This will accumulate argument bytes over potentially many continuations in the local call buffer
-                    self.interface.send_many(&bytes, call_buf_idx)?;
                     Ok(Some(false))
                 }
             }
@@ -522,15 +512,25 @@ impl<'a> Wire<'a> {
                 reader.read_exact(&mut call_buf)?;
                 let call_idx = CallIndex(u32::from_le_bytes(call_buf));
 
+                // Third is whether or not this is the last message in its series
+                let mut terminator_buf = [0u8; 1];
+                reader.read_exact(&mut terminator_buf)?;
+                let is_final = terminator_buf[0] != 0;
+
                 // Then the number of bytes to expect
                 let mut len_buf = [0u8; 4];
                 reader.read_exact(&mut len_buf)?;
                 let num_bytes = u32::from_le_bytes(len_buf);
 
-                // If that's zero, we should end the message
-                if num_bytes == 0 {
-                    // Get the local message buffer index that we said we'd put the response into
-                    let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+                let mut bytes = vec![0u8; num_bytes as usize];
+                reader.read_exact(&mut bytes)?;
+                // Get the local message buffer index that we said we'd put the response into
+                let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+                self.interface.send_many(&bytes, response_idx)?;
+
+                // If this is marked as the last in its series, we should round off the response message and
+                // implicitly signal to any waiting call handles that it's ready to be read
+                if is_final {
                     self.interface.terminate_message(response_idx)?;
                     // If that succeeded, the user should be ready to fetch that, and the index will be reused
                     // after they have, so we should remove it from this map (this is to save space only, because we
@@ -539,12 +539,6 @@ impl<'a> Wire<'a> {
 
                     Ok(Some(true))
                 } else {
-                    let mut bytes = vec![0u8; num_bytes as usize];
-                    reader.read_exact(&mut bytes)?;
-
-                    // Get the local message buffer index that we said we'd put the response into
-                    let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
-                    self.interface.send_many(&bytes, response_idx)?;
                     Ok(Some(false))
                 }
             }
@@ -722,6 +716,7 @@ enum Message<'b> {
     Call {
         procedure_idx: ProcedureIndex, // Remote
         call_idx: CallIndex,           // Remote
+        terminator: bool,
 
         args: &'b [u8],
     },
@@ -732,6 +727,7 @@ enum Message<'b> {
         // buffers whatsoever, allowing the `Wire` to act as a security layer over the `Interface`
         procedure_idx: ProcedureIndex,
         call_idx: CallIndex,
+        terminator: bool,
 
         message: &'b [u8],
     },
@@ -755,8 +751,9 @@ impl<'b> Message<'b> {
     /// ## Procedure call messages (type 1)
     /// 1. Procedure index (u32 in LE byte order)
     /// 2. Call index (u32 in LE byte order)
-    /// 3. Number of message bytes to expect (u32 in LE byte order)
-    /// 4. Raw message bytes
+    /// 3. Whether or not this message is the last in its series (0 or 1 as u8; interpret as 0 = false, else true)
+    /// 4. Number of message bytes to expect (u32 in LE byte order)
+    /// 5. Raw message bytes
     ///
     /// It is expected that a new message buffer will be allocated for each call index of a procedure, allowing
     /// subsequent call messages that complete this call to be added to the correct buffer, without the caller
@@ -769,8 +766,9 @@ impl<'b> Message<'b> {
     /// ## Response messages (type 2)
     /// 1. Procedure index (u32 in LE byte order)
     /// 2. Call index (u32 in LE byte order)
-    /// 3. Number of message bytes to expect (u32 in LE byte order)
-    /// 4. Raw message bytes
+    /// 3. Whether or not this message is the last in its series (0 or 1 as u8; interpret as 0 = false, else true)
+    /// 4. Number of message bytes to expect (u32 in LE byte order)
+    /// 5. Raw message bytes
     ///
     /// If step 2 transmitted length zero, the given message index should be terminated.
     fn to_bytes(&self) -> Result<Vec<u8>, std::io::Error> {
@@ -784,6 +782,7 @@ impl<'b> Message<'b> {
                 procedure_idx,
                 call_idx,
                 args,
+                terminator,
             } => {
                 buf.write_all(&[1])?;
                 // Step 1
@@ -793,10 +792,13 @@ impl<'b> Message<'b> {
                 let call_idx = call_idx.0.to_le_bytes();
                 buf.write_all(&call_idx)?;
                 // Step 3
+                let terminator = &[if *terminator { 1u8 } else { 0u8 }];
+                buf.write_all(terminator)?;
+                // Step 4
                 let num_bytes = args.len() as u32;
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
-                // Step 4 (only bother if we're not terminating)
+                // Step 5 (only bother if it's not empty)
                 if !args.is_empty() {
                     buf.write_all(args)?;
                 }
@@ -805,6 +807,7 @@ impl<'b> Message<'b> {
                 procedure_idx,
                 call_idx,
                 message,
+                terminator,
             } => {
                 buf.write_all(&[2])?;
                 // Step 1
@@ -814,10 +817,13 @@ impl<'b> Message<'b> {
                 let call_idx = call_idx.0.to_le_bytes();
                 buf.write_all(&call_idx)?;
                 // Step 3
+                let terminator = &[if *terminator { 1u8 } else { 0u8 }];
+                buf.write_all(terminator)?;
+                // Step 4
                 let num_bytes = message.len() as u32;
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
-                // Step 4 (only bother if we're not terminating)
+                // Step 5 (only bother if it's not empty)
                 if !message.is_empty() {
                     buf.write_all(message)?;
                 }
