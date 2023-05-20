@@ -83,7 +83,11 @@ pub struct Wire<'a> {
     /// A map that keeps track of how many times each remote procedure has been called, allowing call indices to be intelligently
     /// and largely internally handled.
     remote_call_counter: Arc<DashMap<ProcedureIndex, usize>>,
-    /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed.
+    /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed until
+    /// it is removed.
+    ///
+    /// This serves as a secuirty mechanism to ensure that response messages are mapped *locally* to response buffer indices, which means we can be sure
+    /// that a remote cannot access and control arbitrary message buffers on our local interface, thereby compromising other wires.
     response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), usize>>,
     /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
     terminated: Arc<AtomicBool>,
@@ -120,7 +124,15 @@ impl<'a> Wire<'a> {
     ///
     /// # Security
     ///
-    /// TODO After refactor
+    /// This method implicitly allows this wire to call functions on the remote, which is fine, except that calling a function means
+    /// you need to receive some kind of response (that reception will be done automatically by `.fill()`. it does *not* require waiting
+    /// on the call handle, that is only used to get the response to you and deserialize it). Response messages do not have access to
+    /// local message buffers, and their security is tightly controlled, however they present an additional attack surface that may be
+    /// totally unnecessary in module-style applications.
+    ///
+    /// In short, although there are no known security holes in the procedure response system, programs that exist to have their procedures
+    /// called by others (called 'module-style programs'), and that will not call procedures themselves, should prefer [`Wire::new_module`],
+    /// which disables several wire features to reduce the attack surface.
     pub fn new(interface: &'a Interface) -> Self {
         Self {
             id: interface.get_id(),
@@ -135,7 +147,7 @@ impl<'a> Wire<'a> {
         }
     }
     /// Creates a new buffer-based wire to work with the given interface. This is the same as `.new()`, except it disables support for
-    /// general messages, which are unnecessary in some contexts, where they would only present an additional attack surface. If you
+    /// response messages, which are unnecessary in some contexts, where they would only present an additional attack surface. If you
     /// intend for this wire to be used by the remote to call local functions, but not the other way around, you should use this method.
     pub fn new_module(interface: &'a Interface) -> Self {
         Self {
@@ -286,13 +298,10 @@ impl<'a> Wire<'a> {
         self.response_idx_map
             .insert((procedure_idx, call_idx), response_idx);
 
-        // Get the response index we're using
-        let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
         // Construct the message we want to send
         let msg = Message::Call {
             procedure_idx,
             call_idx,
-            response_idx,
             args,
         };
         // Convert that message into bytes and place it in the queue
@@ -305,6 +314,9 @@ impl<'a> Wire<'a> {
         if !args.is_empty() {
             self.end_given_call(procedure_idx, call_idx)
         } else {
+            // Get the response index we're using
+            let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+
             Ok(CallHandle {
                 response_idx,
                 interface: self.interface,
@@ -352,13 +364,10 @@ impl<'a> Wire<'a> {
             return Err(Error::ZeroLengthInNonTerminating);
         }
 
-        // Get the response index we're using
-        let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
         // Construct the message we want to send
         let msg = Message::Call {
             procedure_idx,
             call_idx,
-            response_idx,
             args,
         };
         // Convert that message into bytes and place it in the queue
@@ -383,19 +392,18 @@ impl<'a> Wire<'a> {
             return Err(Error::CallFromModule);
         }
 
-        // Get the response index we're using
-        let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
         // Construct the zero-length payload message we want to send
         let msg = Message::Call {
             procedure_idx,
             call_idx,
-            response_idx,
             args: &[],
         };
         // Convert that message into bytes and place it in the queue
         let bytes = msg.to_bytes()?;
         self.queue.push(bytes);
 
+        // Get the response index we're using
+        let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
         Ok(CallHandle {
             response_idx,
             interface: self.interface,
@@ -452,11 +460,6 @@ impl<'a> Wire<'a> {
                 reader.read_exact(&mut call_buf)?;
                 let call_idx = CallIndex(u32::from_le_bytes(call_buf) as usize);
 
-                // Third is the message index *on the caller* we'll send the response to
-                let mut response_buf = [0u8; 4];
-                reader.read_exact(&mut response_buf)?;
-                let response_idx = u32::from_le_bytes(response_buf) as usize;
-
                 // Then the number of bytes to expect
                 let mut len_buf = [0u8; 4];
                 reader.read_exact(&mut len_buf)?;
@@ -477,16 +480,18 @@ impl<'a> Wire<'a> {
                     let ret = self
                         .interface
                         .call_procedure(procedure_idx, call_idx, self.id)?;
-                    let ret_msg = Message::General {
-                        message_idx: response_idx,
+                    let ret_msg = Message::Response {
+                        procedure_idx,
+                        call_idx,
                         message: &ret,
                     };
                     let ret_msg_bytes = ret_msg.to_bytes()?;
                     self.queue.push(ret_msg_bytes);
                     // And now we need to terminate that result message
                     self.queue.push(
-                        Message::General {
-                            message_idx: response_idx,
+                        Message::Response {
+                            procedure_idx,
+                            call_idx,
                             message: &[],
                         }
                         .to_bytes()?,
@@ -504,13 +509,18 @@ impl<'a> Wire<'a> {
                     Ok(Some(false))
                 }
             }
-            // General message
+            // Response message
             // For security, we may ignore these completely
             2 if !self.module_style => {
-                // First is the message index
-                let mut idx_buf = [0u8; 4];
-                reader.read_exact(&mut idx_buf)?;
-                let message_idx = u32::from_le_bytes(idx_buf) as usize;
+                // First is the procedure index
+                let mut procedure_buf = [0u8; 4];
+                reader.read_exact(&mut procedure_buf)?;
+                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf) as usize);
+
+                // Second is the call index
+                let mut call_buf = [0u8; 4];
+                reader.read_exact(&mut call_buf)?;
+                let call_idx = CallIndex(u32::from_le_bytes(call_buf) as usize);
 
                 // Then the number of bytes to expect
                 let mut len_buf = [0u8; 4];
@@ -519,13 +529,22 @@ impl<'a> Wire<'a> {
 
                 // If that's zero, we should end the message
                 if num_bytes == 0 {
-                    self.interface.terminate_message(message_idx)?;
+                    // Get the local message buffer index that we said we'd put the response into
+                    let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+                    self.interface.terminate_message(response_idx)?;
+                    // If that succeeded, the user should be ready to fetch that, and the index will be reused
+                    // after they have, so we should remove it from this map (this is to save space only, because we
+                    // know we won't be querying this procedure call again)
+                    self.response_idx_map.remove(&(procedure_idx, call_idx));
+
                     Ok(Some(true))
                 } else {
                     let mut bytes = vec![0u8; num_bytes];
                     reader.read_exact(&mut bytes)?;
 
-                    self.interface.send_many(&bytes, message_idx)?;
+                    // Get the local message buffer index that we said we'd put the response into
+                    let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+                    self.interface.send_many(&bytes, response_idx)?;
                     Ok(Some(false))
                 }
             }
@@ -703,16 +722,16 @@ enum Message<'b> {
     Call {
         procedure_idx: ProcedureIndex, // Remote
         call_idx: CallIndex,           // Remote
-        response_idx: usize,           // Local
 
         args: &'b [u8],
     },
-    /// A general message that knows where it is heading. This is typically used for responses to procedure
-    /// calls, but it can also be used for other, user-defined operations if necessary.
-    ///
-    /// If the message here is an empty vector, this will terminate the given message index.
-    General {
-        message_idx: usize, // Remote
+    /// A response to a `Call` message that contains the return type. This is not necessarily self-contained, and
+    /// requires an explicit termination signal, as procedures may stream data in the future.
+    Response {
+        // These properties are the same as we used in the `Call`, meaning the caller has no influence over our message
+        // buffers whatsoever, allowing the `Wire` to act as a security layer over the `Interface`
+        procedure_idx: ProcedureIndex,
+        call_idx: CallIndex,
 
         message: &'b [u8],
     },
@@ -736,22 +755,22 @@ impl<'b> Message<'b> {
     /// ## Procedure call messages (type 1)
     /// 1. Procedure index (u32 in LE byte order)
     /// 2. Call index (u32 in LE byte order)
-    /// 3. Index of local message buffer that response should be sent to (u32 in LE byte order)
-    /// 4. Number of message bytes to expect (u32 in LE byte order)
-    /// 5. Raw message bytes
+    /// 3. Number of message bytes to expect (u32 in LE byte order)
+    /// 4. Raw message bytes
     ///
     /// It is expected that a new message buffer will be allocated for each call index of a procedure, allowing
     /// subsequent call messages that complete this call to be added to the correct buffer, without the caller
     /// knowing the index of that buffer (the receiver should hold an internal mapping of call indices to
     /// buffer indices).
     ///
-    /// As with general messages, if step 4 transmitted length zero, the given call index should be terminated,
+    /// As with response messages, if step 4 transmitted length zero, the given call index should be terminated,
     /// and the procedure called.
     ///
-    /// ## General messages (type 2)
-    /// 1. Message index (u32 in LE byte order)
-    /// 2. Number of message bytes to expect (u32 in LE byte order)
-    /// 3. Raw message bytes
+    /// ## Response messages (type 2)
+    /// 1. Procedure index (u32 in LE byte order)
+    /// 2. Call index (u32 in LE byte order)
+    /// 3. Number of message bytes to expect (u32 in LE byte order)
+    /// 4. Raw message bytes
     ///
     /// If step 2 transmitted length zero, the given message index should be terminated.
     fn to_bytes(&self) -> Result<Vec<u8>, std::io::Error> {
@@ -764,7 +783,6 @@ impl<'b> Message<'b> {
             Self::Call {
                 procedure_idx,
                 call_idx,
-                response_idx,
                 args,
             } => {
                 buf.write_all(&[1])?;
@@ -775,30 +793,31 @@ impl<'b> Message<'b> {
                 let call_idx = (call_idx.0 as u32).to_le_bytes();
                 buf.write_all(&call_idx)?;
                 // Step 3
-                let response_idx = (*response_idx as u32).to_le_bytes();
-                buf.write_all(&response_idx)?;
-                // Step 4
                 let num_bytes = args.len() as u32;
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
-                // Step 5 (only bother if we're not terminating)
+                // Step 4 (only bother if we're not terminating)
                 if !args.is_empty() {
                     buf.write_all(args)?;
                 }
             }
-            Self::General {
-                message_idx,
+            Self::Response {
+                procedure_idx,
+                call_idx,
                 message,
             } => {
                 buf.write_all(&[2])?;
                 // Step 1
-                let message_idx = (*message_idx as u32).to_le_bytes();
-                buf.write_all(&message_idx)?;
+                let procedure_idx = (procedure_idx.0 as u32).to_le_bytes();
+                buf.write_all(&procedure_idx)?;
                 // Step 2
+                let call_idx = (call_idx.0 as u32).to_le_bytes();
+                buf.write_all(&call_idx)?;
+                // Step 3
                 let num_bytes = message.len() as u32;
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
-                // Step 3 (only bother if we're not terminating)
+                // Step 4 (only bother if we're not terminating)
                 if !message.is_empty() {
                     buf.write_all(message)?;
                 }
