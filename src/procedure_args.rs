@@ -66,14 +66,14 @@ impl_args!(A, B, C, D, E, F, G, H, J, K, L, M, N, P, Q, R, S, T, U, V);
 /// An internal trait used to get the lengths of tuples. This is needed so we can insert the correct
 /// MessagePack length marker when we deserialize the arguments provied piecemeal over an interface.
 pub trait Tuple {
-    fn len() -> usize;
+    fn len() -> u32;
 }
 macro_rules! impl_tuple {
     ($($p:ident),*) => {
         impl<$($p: Serialize + DeserializeOwned),*> Tuple for ($($p,)*)
         {
             #[inline]
-            fn len() -> usize {
+            fn len() -> u32 {
                 #[allow(unused_mut)]
                 let mut counter = 0;
                 $(

@@ -9,24 +9,24 @@ pub enum Error {
     #[error(transparent)]
     Decode(#[from] rmp_serde::decode::Error),
     #[error("the message at local index {index} has already been marked as completed (no further data may be sent to it)")]
-    AlreadyCompleted { index: usize },
+    AlreadyCompleted { index: u32 },
     #[error("the local message index {index} does not currently exist (but it may in future)")]
     OutOfBounds {
         /// The index that was out-of-bounds.
-        index: usize,
+        index: u32,
     },
     #[error("attempted to retrieve local response buffer for a procedure call (with remote procedure index {index} and local call index {call_idx}) that has not yet been started")]
-    NoResponseBuffer { index: usize, call_idx: usize },
+    NoResponseBuffer { index: u32, call_idx: u32 },
     #[error("attempted to send zero-length payload in non-terminating function (sending zero-length payloads would be interpreted by IPFI as a message termination directive)")]
     ZeroLengthInNonTerminating,
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error("no procedure has been registered with index {index}")]
-    NoSuchProcedure { index: usize },
+    NoSuchProcedure { index: u32 },
     #[error("no local message buffer exists with index {index} for provided procedure call (attempted to call procedure before argument preparation)")]
-    NoCallBuffer { index: usize },
+    NoCallBuffer { index: u32 },
     #[error("procedure call buffer with index {index} is incomplete (attempted to call procedure before argument reception was complete)")]
-    CallBufferIncomplete { index: usize },
+    CallBufferIncomplete { index: u32 },
     // This should basically never occur
     #[error("couldn't write length marker for accumulated arguments (likely spontaneous failure)")]
     WriteLenMarkerFailed,

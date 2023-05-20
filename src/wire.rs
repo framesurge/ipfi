@@ -82,13 +82,13 @@ pub struct Wire<'a> {
     queue: Arc<SegQueue<Vec<u8>>>,
     /// A map that keeps track of how many times each remote procedure has been called, allowing call indices to be intelligently
     /// and largely internally handled.
-    remote_call_counter: Arc<DashMap<ProcedureIndex, usize>>,
+    remote_call_counter: Arc<DashMap<ProcedureIndex, u32>>,
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed until
     /// it is removed.
     ///
     /// This serves as a secuirty mechanism to ensure that response messages are mapped *locally* to response buffer indices, which means we can be sure
     /// that a remote cannot access and control arbitrary message buffers on our local interface, thereby compromising other wires.
-    response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), usize>>,
+    response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), u32>>,
     /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
     terminated: Arc<AtomicBool>,
 }
@@ -416,7 +416,7 @@ impl<'a> Wire<'a> {
         &self,
         procedure_idx: ProcedureIndex,
         call_idx: CallIndex,
-    ) -> Result<usize, Error> {
+    ) -> Result<u32, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -453,17 +453,17 @@ impl<'a> Wire<'a> {
                 // First is the procedure index
                 let mut procedure_buf = [0u8; 4];
                 reader.read_exact(&mut procedure_buf)?;
-                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf) as usize);
+                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf));
 
                 // Second is the call index
                 let mut call_buf = [0u8; 4];
                 reader.read_exact(&mut call_buf)?;
-                let call_idx = CallIndex(u32::from_le_bytes(call_buf) as usize);
+                let call_idx = CallIndex(u32::from_le_bytes(call_buf));
 
                 // Then the number of bytes to expect
                 let mut len_buf = [0u8; 4];
                 reader.read_exact(&mut len_buf)?;
-                let num_bytes = u32::from_le_bytes(len_buf) as usize;
+                let num_bytes = u32::from_le_bytes(len_buf);
 
                 // We need to know where to put argument information
                 let call_buf_idx = self
@@ -501,7 +501,7 @@ impl<'a> Wire<'a> {
                     // We're continuing or starting a new partial procedure argument addition, so get a local message
                     // buffer for it if there isn't already one
 
-                    let mut bytes = vec![0u8; num_bytes];
+                    let mut bytes = vec![0u8; num_bytes as usize];
                     reader.read_exact(&mut bytes)?;
 
                     // This will accumulate argument bytes over potentially many continuations in the local call buffer
@@ -515,17 +515,17 @@ impl<'a> Wire<'a> {
                 // First is the procedure index
                 let mut procedure_buf = [0u8; 4];
                 reader.read_exact(&mut procedure_buf)?;
-                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf) as usize);
+                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf));
 
                 // Second is the call index
                 let mut call_buf = [0u8; 4];
                 reader.read_exact(&mut call_buf)?;
-                let call_idx = CallIndex(u32::from_le_bytes(call_buf) as usize);
+                let call_idx = CallIndex(u32::from_le_bytes(call_buf));
 
                 // Then the number of bytes to expect
                 let mut len_buf = [0u8; 4];
                 reader.read_exact(&mut len_buf)?;
-                let num_bytes = u32::from_le_bytes(len_buf) as usize;
+                let num_bytes = u32::from_le_bytes(len_buf);
 
                 // If that's zero, we should end the message
                 if num_bytes == 0 {
@@ -539,7 +539,7 @@ impl<'a> Wire<'a> {
 
                     Ok(Some(true))
                 } else {
-                    let mut bytes = vec![0u8; num_bytes];
+                    let mut bytes = vec![0u8; num_bytes as usize];
                     reader.read_exact(&mut bytes)?;
 
                     // Get the local message buffer index that we said we'd put the response into
@@ -659,7 +659,7 @@ impl Drop for Wire<'_> {
 pub struct CallHandle<'a> {
     /// The message index to wait for. If this is improperly initialised, we will probably get completely different and almost
     /// certainly invalid data.
-    response_idx: usize,
+    response_idx: u32,
     /// The interface where the response will appear.
     interface: &'a Interface,
 }
@@ -787,10 +787,10 @@ impl<'b> Message<'b> {
             } => {
                 buf.write_all(&[1])?;
                 // Step 1
-                let procedure_idx = (procedure_idx.0 as u32).to_le_bytes();
+                let procedure_idx = procedure_idx.0.to_le_bytes();
                 buf.write_all(&procedure_idx)?;
                 // Step 2
-                let call_idx = (call_idx.0 as u32).to_le_bytes();
+                let call_idx = call_idx.0.to_le_bytes();
                 buf.write_all(&call_idx)?;
                 // Step 3
                 let num_bytes = args.len() as u32;
@@ -808,10 +808,10 @@ impl<'b> Message<'b> {
             } => {
                 buf.write_all(&[2])?;
                 // Step 1
-                let procedure_idx = (procedure_idx.0 as u32).to_le_bytes();
+                let procedure_idx = procedure_idx.0.to_le_bytes();
                 buf.write_all(&procedure_idx)?;
                 // Step 2
-                let call_idx = (call_idx.0 as u32).to_le_bytes();
+                let call_idx = call_idx.0.to_le_bytes();
                 buf.write_all(&call_idx)?;
                 // Step 3
                 let num_bytes = message.len() as u32;
