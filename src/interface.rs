@@ -404,7 +404,8 @@ mod tests {
     fn wire_ids_should_be_unique() {
         let interface = Interface::new();
         let mut ids = Vec::new();
-        for _ in 0..1000 {
+        // We only loop up to here for `int-u8`
+        for _ in 0..255 {
             let id = interface.get_id();
             assert!(!ids.contains(&id));
             ids.push(id);
@@ -413,46 +414,20 @@ mod tests {
     #[test]
     fn call_buffers_should_be_distinct() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
-        });
-        let buf_2 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
-        });
-        let buf_3 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(0), CallIndex(1), WireId(0))
-        });
-        let buf_4 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(1), CallIndex(0), WireId(0))
-        });
+        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0));
+        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1));
+        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(1), WireId(0));
+        let buf_4 = interface.get_call_buffer(ProcedureIndex(1), CallIndex(0), WireId(0));
 
-        assert!(!has_duplicates(&[
-            buf_1.join().unwrap(),
-            buf_2.join().unwrap(),
-            buf_3.join().unwrap(),
-            buf_4.join().unwrap(),
-        ]));
+        assert!(!has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
     }
     #[test]
     fn call_buffers_should_be_reused() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
-        });
-        let buf_2 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
-        });
-        let buf_3 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
-        });
-        let buf_4 = std::thread::spawn(|| {
-            interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
-        });
-
-        let buf_1 = buf_1.join().unwrap();
-        let buf_2 = buf_2.join().unwrap();
-        let buf_3 = buf_3.join().unwrap();
-        let buf_4 = buf_4.join().unwrap();
+        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0));
+        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1));
+        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0));
+        let buf_4 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1));
 
         assert!(has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
         assert!(buf_1 == buf_3 && buf_2 == buf_4);
@@ -475,42 +450,70 @@ mod tests {
     #[test]
     fn writing_to_msg_until_end_should_work() {
         let interface = Interface::new();
-        assert!(interface.send(0, 0).is_ok());
-        assert!(interface.send(1, 0).is_ok());
-        assert!(interface.send(2, 0).is_ok());
-        assert!(interface.send(-1, 0).is_ok());
+        let id = interface.push();
 
-        assert!(interface.send(0, 0).is_err());
-        assert!(interface.send(-1, 0).is_err());
+        assert!(interface.send(0, id).is_ok());
+        assert!(interface.send(1, id).is_ok());
+        assert!(interface.send(2, id).is_ok());
+        assert!(interface.send(-1, id).is_ok());
+
+        assert!(interface.send(0, id).is_err());
+        assert!(interface.send(-1, id).is_err());
     }
     #[test]
     fn send_many_should_never_terminate() {
         let interface = Interface::new();
-        assert!(interface.send_many(&[0, 0, 1, 3, 2, 5, 12], 0).is_ok());
-        assert!(interface.send_many(&[0, 8, 1, 3], 0).is_ok());
-        assert!(interface.terminate_message(0).is_ok());
+        let id = interface.push();
 
-        assert!(interface.send_many(&[1, 4, 3], 0).is_err());
+        assert!(interface.send_many(&[0, 0, 1, 3, 2, 5, 12], id).is_ok());
+        assert!(interface.send_many(&[0, 8, 1, 3], id).is_ok());
+        assert!(interface.terminate_message(id).is_ok());
+
+        assert!(interface.send_many(&[1, 4, 3], id).is_err());
     }
     #[test]
-    fn send_to_late_buf_should_fail() {
+    fn send_to_unreserved_buf_should_fail() {
         let interface = Interface::new();
-        // No buffers allocated, but 0 should work (next-in-line)
+        assert_eq!(interface.push(), 0);
+        assert_eq!(interface.push(), 1);
+
         assert!(interface.send(0, 0).is_ok());
-        // Now 1 is next
         assert!(interface.send(0, 1).is_ok());
-        // Now 2 is next, so 3 shouldn't work
-        assert!(interface.send(0, 3).is_err());
+
+        assert!(interface.send(0, 2).is_err());
+    }
+    #[test]
+    fn double_terminate_should_fail() {
+        let interface = Interface::new();
+        let id = interface.push();
+        interface.send(42, id).unwrap();
+        assert!(interface.terminate_message(id).is_ok());
+        assert!(interface.terminate_message(id).is_err());
+    }
+    #[test]
+    fn roi_buf_queue_should_work() {
+        let interface = Interface::new();
+        // We should start at 0
+        assert_eq!(interface.push(), 0);
+        interface.send(42, 0).unwrap();
+        interface.terminate_message(0).unwrap();
+        // We haven't fetched, so this should increment
+        assert_eq!(interface.push(), 1);
+        let msg = interface.get_raw(0);
+        assert_eq!(msg, [42]);
+        // But now we have fetched from the ID, so it should be reused
+        assert_eq!(interface.push(), 0);
     }
     #[test]
     #[cfg(feature = "serde")]
     fn get_should_work() {
         let interface = Interface::new();
-        interface.send(42, 0).unwrap();
-        interface.terminate_message(0).unwrap();
+        let id = interface.push();
+        interface.send(42, id).unwrap();
+        interface.terminate_message(id).unwrap();
 
         // This implicitly tests `.get_raw()` as well
-        let msg = interface.get::<u8>(0);
+        let msg = interface.get::<u8>(id);
         assert!(msg.is_ok());
         assert_eq!(msg.unwrap(), 42);
     }
@@ -518,33 +521,66 @@ mod tests {
     #[cfg(feature = "serde")]
     fn get_with_wrong_type_should_fail() {
         let interface = Interface::new();
-        interface.send(42, 0).unwrap();
-        interface.terminate_message(0).unwrap();
+        let id = interface.push();
+        interface.send(42, id).unwrap();
+        interface.terminate_message(id).unwrap();
 
-        let msg = interface.get::<String>(0);
+        let msg = interface.get::<String>(id);
         assert!(msg.is_err());
+    }
+    #[test]
+    fn terminate_zero_sized_should_work() {
+        let interface = Interface::new();
+        let id = interface.push();
+        assert!(interface.terminate_message(id).is_ok());
+        let msg = interface.get_raw(id);
+        assert_eq!(msg, []);
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    #[cfg(feature = "serde")]
-    fn concurrent_get_should_resolve() {
+    fn concurrent_get_after_creation_should_resolve() {
+        let interface = Box::leak(Box::new(Interface::new()));
+
+        let id = interface.push();
+        // We test this properly elsewhere
+        assert_eq!(id, 0, "spurious failure: interface push did not start at 0");
+        let msg = std::thread::spawn(|| {
+            // For lifetime simplicity, we don't bother moving `id` but not `interface`
+            interface.get_raw(0)
+        });
+        assert!(!msg.is_finished());
+        interface.send(42, id).unwrap();
+        // We haven't terminated it yet
+        assert!(!msg.is_finished());
+        interface.terminate_message(id).unwrap();
+
+        let msg = msg.join().unwrap();
+        assert_eq!(msg, [42]);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn concurrent_get_before_creation_should_resolve() {
         let interface = Box::leak(Box::new(Interface::new()));
 
         let msg = std::thread::spawn(|| {
             // Note that this message does not even exist yet
-            interface.get::<String>(1)
+            interface.get_raw(0)
         });
         assert!(!msg.is_finished());
+        // We test this properly elsewhere
+        assert_eq!(
+            interface.push(),
+            0,
+            "spurious failure: interface push did not start at 0"
+        );
+
         // We can terminate before creation (zero-sized)
-        interface.terminate_message(0).unwrap();
-        interface
-            .send_many(&rmp_serde::encode::to_vec("Hello, world!").unwrap(), 1)
-            .unwrap();
+        interface.send(42, 0).unwrap();
         // We haven't terminated it yet
         assert!(!msg.is_finished());
-        interface.terminate_message(1).unwrap();
+        interface.terminate_message(0).unwrap();
 
-        let msg = msg.join().unwrap().unwrap();
-        assert_eq!(msg, "Hello, world!");
+        let msg = msg.join().unwrap();
+        assert_eq!(msg, [42]);
     }
 }

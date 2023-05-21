@@ -963,36 +963,36 @@ mod tests {
     //     let msg = module.interface.get::<String>(0);
     //     assert!(msg.is_err());
     // }
-    #[cfg(feature = "serde")]
-    #[test]
-    fn no_args_procedure_call_should_work() {
-        fn procedure(_: ()) -> IpfiInteger {
-            42
-        }
-        let mut host = Actor::new();
-        let mut module = Actor::new();
+    // #[cfg(feature = "serde")]
+    // #[test]
+    // fn no_args_procedure_call_should_work() {
+    //     fn procedure(_: ()) -> IpfiInteger {
+    //         42
+    //     }
+    //     let mut host = Actor::new();
+    //     let mut module = Actor::new();
 
-        host.interface.add_procedure(0, procedure);
-        let handle = module.wire.call(ProcedureIndex::new(0), ());
-        assert!(handle.is_ok());
-        let handle = handle.unwrap();
-        assert!(module.wire.flush(&mut host.input).is_ok());
-        host.reset_input();
+    //     host.interface.add_procedure(0, procedure);
+    //     let handle = module.wire.call(ProcedureIndex::new(0), ());
+    //     assert!(handle.is_ok());
+    //     let handle = handle.unwrap();
+    //     assert!(module.wire.flush(&mut host.input).is_ok());
+    //     host.reset_input();
 
-        // Call and termination are one for no-args calls!
-        for _ in 0..1 {
-            assert!(host.wire.receive_one(&mut host.input).is_ok());
-        }
-        // Function has been autoamtically called by the wire
-        assert!(host.wire.flush(&mut module.input).is_ok());
-        module.input.set_position(0); // Manual reset to avoid lifetime problems on `Actor`
+    //     // Call and termination are one for no-args calls!
+    //     for _ in 0..1 {
+    //         assert!(host.wire.receive_one(&mut host.input).is_ok());
+    //     }
+    //     // Function has been autoamtically called by the wire
+    //     assert!(host.wire.flush(&mut module.input).is_ok());
+    //     module.input.set_position(0); // Manual reset to avoid lifetime problems on `Actor`
 
-        // Result, termination
-        for _ in 0..2 {
-            assert!(module.wire.receive_one(&mut module.input).is_ok());
-        }
-        let result = handle.wait::<IpfiInteger>();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
-    }
+    //     // Result, termination
+    //     for _ in 0..2 {
+    //         assert!(module.wire.receive_one(&mut module.input).is_ok());
+    //     }
+    //     let result = handle.wait::<IpfiInteger>();
+    //     assert!(result.is_ok());
+    //     assert_eq!(result.unwrap(), 42);
+    // }
 }

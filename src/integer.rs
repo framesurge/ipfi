@@ -1,6 +1,5 @@
-use std::io::Read;
-
 use crate::IpfiInteger;
+use std::io::Read;
 
 /// Takes in a numerical value and converts it into the smallest Rust integer type it can. For instance,
 /// anything below 255 will be converted into a `u8`.
@@ -72,6 +71,7 @@ pub(crate) fn get_as_smallest_int_from_usize(value: usize) -> Integer {
 
 /// A representation of different integer types. This supports everything up to `u64` (IPFI does not support
 /// sending 128-bit integers at this time).
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Integer {
     U8(u8),
     U16(u16),
@@ -250,5 +250,234 @@ impl Integer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn correctly_shrinks_ints() {
+        let fits_in_u8 = u8::MAX as IpfiInteger;
+        assert!(matches!(
+            get_as_smallest_int(fits_in_u8),
+            Integer::U8(u8::MAX)
+        ));
+        #[cfg(feature = "int-u16")]
+        {
+            let fits_in_u16 = u16::MAX;
+            assert!(matches!(
+                get_as_smallest_int(fits_in_u16),
+                Integer::U16(u16::MAX)
+            ));
+        }
+        #[cfg(feature = "int-u32")]
+        {
+            let fits_in_u16 = u16::MAX as IpfiInteger;
+            assert!(matches!(
+                get_as_smallest_int(fits_in_u16),
+                Integer::U16(u16::MAX)
+            ));
+            let fits_in_u32 = u32::MAX;
+            assert!(matches!(
+                get_as_smallest_int(fits_in_u32),
+                Integer::U32(u32::MAX)
+            ));
+        }
+        #[cfg(feature = "int-u64")]
+        {
+            let fits_in_u16 = u16::MAX as IpfiInteger;
+            assert!(matches!(
+                get_as_smallest_int(fits_in_u16),
+                Integer::U16(u16::MAX)
+            ));
+            let fits_in_u32 = u32::MAX as IpfiInteger;
+            assert!(matches!(
+                get_as_smallest_int(fits_in_u32),
+                Integer::U32(u32::MAX)
+            ));
+            let fits_in_u64 = u64::MAX;
+            assert!(matches!(
+                get_as_smallest_int(fits_in_u64),
+                Integer::U64(u64::MAX)
+            ));
+        }
+    }
+    #[test]
+    fn correctly_shrinks_usizes() {
+        let fits_in_u8 = u8::MAX as usize;
+        assert!(matches!(
+            get_as_smallest_int_from_usize(fits_in_u8),
+            Integer::U8(u8::MAX)
+        ));
+        let fits_in_u16 = u16::MAX as usize;
+        assert!(matches!(
+            get_as_smallest_int_from_usize(fits_in_u16),
+            Integer::U16(u16::MAX)
+        ));
+        #[cfg(target_pointer_width = "32")]
+        {
+            let fits_in_u32 = u32::MAX;
+            assert!(matches!(
+                get_as_smallest_int_from_usize(fits_in_u32),
+                Integer::U32(u32::MAX)
+            ));
+        }
+        #[cfg(target_pointer_width = "64")]
+        {
+            let fits_in_u32 = u32::MAX as usize;
+            assert!(matches!(
+                get_as_smallest_int_from_usize(fits_in_u32),
+                Integer::U32(u32::MAX)
+            ));
+            let fits_in_u64 = u64::MAX as usize;
+            assert!(matches!(
+                get_as_smallest_int_from_usize(fits_in_u64),
+                Integer::U64(u64::MAX)
+            ));
+        }
+    }
+    #[test]
+    fn flag_conversions_should_work() {
+        // Using zeroes here because `::from_flag()` populates with zeroes by default
+        let u8 = Integer::U8(0);
+        let u16 = Integer::U16(0);
+        let u32 = Integer::U32(0);
+        let u64 = Integer::U64(0);
+
+        let u8_flag = u8.to_flag();
+        let u16_flag = u16.to_flag();
+        let u32_flag = u32.to_flag();
+        let u64_flag = u64.to_flag();
+
+        assert_eq!(Integer::from_flag(u8_flag), u8);
+        assert_eq!(Integer::from_flag(u16_flag), u16);
+        assert_eq!(Integer::from_flag(u32_flag), u32);
+        assert_eq!(Integer::from_flag(u64_flag), u64);
+    }
+    #[test]
+    fn le_bytes_to_from_cursor_should_work() {
+        let u8 = Integer::U8(5);
+        let u16 = Integer::U16(u8::MAX as u16 + 1);
+        let u32 = Integer::U32(u16::MAX as u32 + 1);
+        let u64 = Integer::U64(u32::MAX as u64 + 1);
+
+        let mut u8_bytes = Cursor::new(u8.to_le_bytes());
+        let mut u16_bytes = Cursor::new(u16.to_le_bytes());
+        let mut u32_bytes = Cursor::new(u32.to_le_bytes());
+        let mut u64_bytes = Cursor::new(u64.to_le_bytes());
+
+        assert_eq!(
+            Integer::U8(0).populate_from_reader(&mut u8_bytes).unwrap(),
+            u8
+        );
+        assert_eq!(
+            Integer::U16(0)
+                .populate_from_reader(&mut u16_bytes)
+                .unwrap(),
+            u16
+        );
+        assert_eq!(
+            Integer::U32(0)
+                .populate_from_reader(&mut u32_bytes)
+                .unwrap(),
+            u32
+        );
+        assert_eq!(
+            Integer::U64(0)
+                .populate_from_reader(&mut u64_bytes)
+                .unwrap(),
+            u64
+        );
+
+        // And quickly make sure reading from the wrong one would fail
+        u8_bytes.set_position(0);
+        u16_bytes.set_position(0);
+        assert!(Integer::U16(0).populate_from_reader(&mut u8_bytes).is_err());
+        assert_ne!(
+            Integer::U8(0).populate_from_reader(&mut u16_bytes).unwrap(),
+            u8
+        );
+    }
+    #[test]
+    fn into_int_should_work() {
+        // Not all these *types* will fit, but their values will
+        assert_eq!(Integer::U8(5).into_int(), Some(5));
+        assert_eq!(Integer::U16(5).into_int(), Some(5));
+        assert_eq!(Integer::U32(5).into_int(), Some(5));
+        assert_eq!(Integer::U64(5).into_int(), Some(5));
+
+        // These on the other hand won't necessarily
+        #[cfg(feature = "int-u8")]
+        {
+            assert_eq!(Integer::U16(u8::MAX as u16 + 1).into_int(), None);
+            assert_eq!(Integer::U32(u16::MAX as u32 + 1).into_int(), None);
+            assert_eq!(Integer::U64(u32::MAX as u64 + 1).into_int(), None);
+        }
+        #[cfg(feature = "int-u16")]
+        {
+            assert_eq!(
+                Integer::U16(u8::MAX as u16 + 1).into_int(),
+                Some(u8::MAX as u16 + 1)
+            );
+            assert_eq!(Integer::U32(u16::MAX as u32 + 1).into_int(), None);
+            assert_eq!(Integer::U64(u32::MAX as u64 + 1).into_int(), None);
+        }
+        #[cfg(feature = "int-u32")]
+        {
+            assert_eq!(
+                Integer::U16(u8::MAX as u16 + 1).into_int(),
+                Some(u8::MAX as u32 + 1)
+            );
+            assert_eq!(
+                Integer::U32(u16::MAX as u32 + 1).into_int(),
+                Some(u16::MAX as u32 + 1)
+            );
+            assert_eq!(Integer::U64(u32::MAX as u64 + 1).into_int(), None);
+        }
+        #[cfg(feature = "int-u64")]
+        {
+            assert_eq!(
+                Integer::U16(u8::MAX as u16 + 1).into_int(),
+                Some(u8::MAX as u64 + 1)
+            );
+            assert_eq!(
+                Integer::U32(u16::MAX as u32 + 1).into_int(),
+                Some(u16::MAX as u64 + 1)
+            );
+            assert_eq!(
+                Integer::U64(u32::MAX as u64 + 1).into_int(),
+                Some(u32::MAX as u64 + 1)
+            );
+        }
+    }
+    #[test]
+    fn into_usize_should_work() {
+        // Barring very exotic platforms, these should always work
+        assert_eq!(Integer::U8(5).into_usize(), Some(5));
+        assert_eq!(
+            Integer::U16(u8::MAX as u16 + 1).into_usize(),
+            Some(u8::MAX as usize + 1)
+        );
+        assert_eq!(
+            Integer::U32(u16::MAX as u32 + 1).into_usize(),
+            Some(u16::MAX as usize + 1)
+        );
+
+        #[cfg(target_pointer_width = "32")]
+        {
+            // This can be made to fit by its value
+            assert_eq!(
+                Integer::U64(u32::MAX as u64).into_usize(),
+                Some(u32::MAX as usize)
+            );
+            // This, on the other hand, cannot
+            assert_eq!(Integer::U64(u64::MAX).into_usize(), None);
+        }
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(Integer::U64(u64::MAX).into_usize(), Some(u64::MAX as usize));
     }
 }

@@ -42,7 +42,43 @@ impl RoiQueue {
     }
     /// Marks the given identifier as relinquished. After this method is called, the given identifier will almost certainly
     /// point to something else, and as such it should no longer be considered valid.
+    ///
+    /// # Validity
+    ///
+    /// For speed, this function performs no checks that the ID provided has actually been issued by this queue yet, meaning
+    /// it is possible to relinquish an ID that does not yet exist, which would lead to very strange, although perfectly safe,
+    /// semantics.
     pub fn relinquish(&self, id: IpfiInteger) {
         self.relinquished.push(id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RoiQueue;
+
+    #[test]
+    fn should_start_at_zero() {
+        let queue = RoiQueue::new();
+        let id = queue.get();
+        assert_eq!(id, 0);
+    }
+    #[test]
+    fn should_increment_without_relinquish() {
+        let queue = RoiQueue::new();
+        assert_eq!(queue.get(), 0);
+        assert_eq!(queue.get(), 1);
+        assert_eq!(queue.get(), 2);
+    }
+    #[test]
+    fn should_reuse_when_relinquished() {
+        let queue = RoiQueue::new();
+        assert_eq!(queue.get(), 0);
+        assert_eq!(queue.get(), 1);
+        queue.relinquish(0);
+        assert_eq!(queue.get(), 0);
+        queue.relinquish(1);
+        assert_eq!(queue.get(), 1);
+        assert_eq!(queue.get(), 2);
     }
 }
