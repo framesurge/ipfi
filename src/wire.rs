@@ -434,8 +434,8 @@ impl<'a> Wire<'a> {
     /// If a procedure call is completed in this read, this method will automatically block waiting for the response,
     /// and it will followingly add said response to the internal writer queue.
     ///
-    /// This returns whether or not it read a message/call termination message). That will also return `true` if a wire
-    /// termination message is received. Alternately, `None` will be returned if there was a manual end of input message.
+    /// This returns whether or not it read a message/call termination message). Alternately, `None` will be returned
+    /// if there was a manual end of input message, or on a wire termination.
     pub fn receive_one(&self, reader: &mut impl Read) -> Result<Option<bool>, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
@@ -544,7 +544,7 @@ impl<'a> Wire<'a> {
                 // This will lead all other operation to fail, potentially in the middle of their work
                 self.mark_terminated();
 
-                Ok(Some(true))
+                Ok(None)
             }
             // Unknown message types will be ignored
             _ => Ok(Some(false)),
