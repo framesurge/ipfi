@@ -1,8 +1,10 @@
+use crate::integer::*;
 #[cfg(feature = "serde")]
 use crate::procedure_args::ProcedureArgs;
 use crate::{
     error::Error,
     interface::{CallIndex, Interface, ProcedureIndex, WireId},
+    IpfiInteger,
 };
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
@@ -82,13 +84,13 @@ pub struct Wire<'a> {
     queue: Arc<SegQueue<Vec<u8>>>,
     /// A map that keeps track of how many times each remote procedure has been called, allowing call indices to be intelligently
     /// and largely internally handled.
-    remote_call_counter: Arc<DashMap<ProcedureIndex, u32>>,
+    remote_call_counter: Arc<DashMap<ProcedureIndex, IpfiInteger>>,
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed until
     /// it is removed.
     ///
     /// This serves as a secuirty mechanism to ensure that response messages are mapped *locally* to response buffer indices, which means we can be sure
     /// that a remote cannot access and control arbitrary message buffers on our local interface, thereby compromising other wires.
-    response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), u32>>,
+    response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), IpfiInteger>>,
     /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
     terminated: Arc<AtomicBool>,
 }
@@ -412,7 +414,7 @@ impl<'a> Wire<'a> {
         &self,
         procedure_idx: ProcedureIndex,
         call_idx: CallIndex,
-    ) -> Result<u32, Error> {
+    ) -> Result<IpfiInteger, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -444,102 +446,94 @@ impl<'a> Wire<'a> {
         reader.read_exact(&mut ty_buf)?;
         let ty = u8::from_le_bytes(ty_buf);
         match ty {
-            // Procedure call
-            1 => {
-                // First is the procedure index
-                let mut procedure_buf = [0u8; 4];
-                reader.read_exact(&mut procedure_buf)?;
-                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf));
+            // Expressly ignorre general messages if we're a module
+            2 if self.module_style => Ok(Some(false)),
+            // Procedure call or response thereto (same base format)
+            1 | 2 => {
+                // First is the multiflag
+                let mut multiflag_buf = [0u8; 1];
+                reader.read_exact(&mut multiflag_buf)?;
+                let bits = u8_to_bool_array(multiflag_buf[0]);
+                // The second-last bit represents whether or not this is the final message in its series
+                let is_final = bits[6];
 
-                // Second is the call index
-                let mut call_buf = [0u8; 4];
-                reader.read_exact(&mut call_buf)?;
-                let call_idx = CallIndex(u32::from_le_bytes(call_buf));
+                // Then the procedure index
+                let procedure_idx = Integer::from_flag((bits[0], bits[1]))
+                    .populate_from_reader(reader)?
+                    .into_int()
+                    .ok_or(Error::IdxTooBig)?;
+                let procedure_idx = ProcedureIndex(procedure_idx);
+                // Then the call index
+                let call_idx = Integer::from_flag((bits[2], bits[3]))
+                    .populate_from_reader(reader)?
+                    .into_int()
+                    .ok_or(Error::IdxTooBig)?;
+                let call_idx = CallIndex(call_idx);
+                // Then the number of bytes to expect (this will only be too big if there's a pointer width disparity)
+                let num_bytes = Integer::from_flag((bits[4], bits[5]))
+                    .populate_from_reader(reader)?
+                    .into_usize()
+                    .ok_or(Error::IdxTooBig)?;
 
-                // Third is whether or not this is the last message in its series
-                let mut terminator_buf = [0u8; 1];
-                reader.read_exact(&mut terminator_buf)?;
-                let is_final = terminator_buf[0] != 0;
-
-                // Then the number of bytes to expect
-                let mut len_buf = [0u8; 4];
-                reader.read_exact(&mut len_buf)?;
-                let num_bytes = u32::from_le_bytes(len_buf);
-
-                // We need to know where to put argument information
-                let call_buf_idx = self
-                    .interface
-                    .get_call_buffer(procedure_idx, call_idx, self.id);
-
-                let mut bytes = vec![0u8; num_bytes as usize];
+                // Read the number of bytes we expect
+                let mut bytes = vec![0u8; num_bytes];
                 reader.read_exact(&mut bytes)?;
-                // This will accumulate argument bytes over potentially many continuations in the local call buffer
-                self.interface.send_many(&bytes, call_buf_idx)?;
 
-                // If this message was the last in its series, we should call the procedure, assuming we have all the arguments
-                // we need
-                if is_final {
-                    self.interface.terminate_message(call_buf_idx)?;
+                // Now diverge
+                match ty {
+                    // Call
+                    1 => {
+                        // We need to know where to put argument information
+                        let call_buf_idx =
+                            self.interface
+                                .get_call_buffer(procedure_idx, call_idx, self.id);
+                        // And now put it there, accumulating across many messages as necessary
+                        self.interface.send_many(&bytes, call_buf_idx)?;
 
-                    // This will actually execute!
-                    // Note that this will remove the `call_buf_idx` mapping and drain the arguments out of that buffer
-                    let ret = self
-                        .interface
-                        .call_procedure(procedure_idx, call_idx, self.id)?;
-                    let ret_msg = Message::Response {
-                        procedure_idx,
-                        call_idx,
-                        message: &ret,
-                        terminator: true,
-                    };
-                    let ret_msg_bytes = ret_msg.to_bytes()?;
-                    self.queue.push(ret_msg_bytes);
-                    Ok(Some(true))
-                } else {
-                    Ok(Some(false))
-                }
-            }
-            // Response message
-            // For security, we may ignore these completely
-            2 if !self.module_style => {
-                // First is the procedure index
-                let mut procedure_buf = [0u8; 4];
-                reader.read_exact(&mut procedure_buf)?;
-                let procedure_idx = ProcedureIndex(u32::from_le_bytes(procedure_buf));
+                        // If this message was the last in its series, we should call the procedure, assuming we have all the arguments
+                        // we need
+                        if is_final {
+                            self.interface.terminate_message(call_buf_idx)?;
 
-                // Second is the call index
-                let mut call_buf = [0u8; 4];
-                reader.read_exact(&mut call_buf)?;
-                let call_idx = CallIndex(u32::from_le_bytes(call_buf));
+                            // This will actually execute!
+                            // Note that this will remove the `call_buf_idx` mapping and drain the arguments out of that buffer
+                            let ret =
+                                self.interface
+                                    .call_procedure(procedure_idx, call_idx, self.id)?;
+                            let ret_msg = Message::Response {
+                                procedure_idx,
+                                call_idx,
+                                message: &ret,
+                                terminator: true,
+                            };
+                            let ret_msg_bytes = ret_msg.to_bytes()?;
+                            self.queue.push(ret_msg_bytes);
+                            Ok(Some(true))
+                        } else {
+                            Ok(Some(false))
+                        }
+                    }
+                    // Response
+                    2 => {
+                        // Get the local message buffer index that we said we'd put the response into
+                        let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
+                        self.interface.send_many(&bytes, response_idx)?;
 
-                // Third is whether or not this is the last message in its series
-                let mut terminator_buf = [0u8; 1];
-                reader.read_exact(&mut terminator_buf)?;
-                let is_final = terminator_buf[0] != 0;
+                        // If this is marked as the last in its series, we should round off the response message and
+                        // implicitly signal to any waiting call handles that it's ready to be read
+                        if is_final {
+                            self.interface.terminate_message(response_idx)?;
+                            // If that succeeded, the user should be ready to fetch that, and the index will be reused
+                            // after they have, so we should remove it from this map (this is to save space only, because we
+                            // know we won't be querying this procedure call again)
+                            self.response_idx_map.remove(&(procedure_idx, call_idx));
 
-                // Then the number of bytes to expect
-                let mut len_buf = [0u8; 4];
-                reader.read_exact(&mut len_buf)?;
-                let num_bytes = u32::from_le_bytes(len_buf);
-
-                let mut bytes = vec![0u8; num_bytes as usize];
-                reader.read_exact(&mut bytes)?;
-                // Get the local message buffer index that we said we'd put the response into
-                let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
-                self.interface.send_many(&bytes, response_idx)?;
-
-                // If this is marked as the last in its series, we should round off the response message and
-                // implicitly signal to any waiting call handles that it's ready to be read
-                if is_final {
-                    self.interface.terminate_message(response_idx)?;
-                    // If that succeeded, the user should be ready to fetch that, and the index will be reused
-                    // after they have, so we should remove it from this map (this is to save space only, because we
-                    // know we won't be querying this procedure call again)
-                    self.response_idx_map.remove(&(procedure_idx, call_idx));
-
-                    Ok(Some(true))
-                } else {
-                    Ok(Some(false))
+                            Ok(Some(true))
+                        } else {
+                            Ok(Some(false))
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
             // Manual end of input (we should stop whatever called this with a clean error)
@@ -653,7 +647,7 @@ impl Drop for Wire<'_> {
 pub struct CallHandle<'a> {
     /// The message index to wait for. If this is improperly initialised, we will probably get completely different and almost
     /// certainly invalid data.
-    response_idx: u32,
+    response_idx: IpfiInteger,
     /// The interface where the response will appear.
     interface: &'a Interface,
 }
@@ -741,7 +735,8 @@ enum Message<'b> {
     EndOfInput,
 }
 impl<'b> Message<'b> {
-    /// Writes the message in byte form to the given writer, according to the IPFI Binary Format (ipfiBuF).
+    /// Writes the message in byte form to the given writer, according to the IPFI Binary Format (ipfiBuF). Where `IpfiInteger` is
+    /// stated below, this is subject to detection of where a smaller payload size can be used.
     ///
     /// First, a single byte indicating the message type is sent.
     ///
@@ -749,10 +744,10 @@ impl<'b> Message<'b> {
     /// No data is sent, these act as an indication that the program is now terminating.
     ///
     /// ## Procedure call messages (type 1)
-    /// 1. Procedure index (u32 in LE byte order)
-    /// 2. Call index (u32 in LE byte order)
-    /// 3. Whether or not this message is the last in its series (0 or 1 as u8; interpret as 0 = false, else true)
-    /// 4. Number of message bytes to expect (u32 in LE byte order)
+    /// 1. Multiflag (3 2-bit integers for sizings of next three steps, 1 bit for terminator status, final bit empty)
+    /// 2. Procedure index
+    /// 3. Call index
+    /// 4. Number of message bytes to expect
     /// 5. Raw message bytes
     ///
     /// It is expected that a new message buffer will be allocated for each call index of a procedure, allowing
@@ -764,10 +759,10 @@ impl<'b> Message<'b> {
     /// and the procedure called.
     ///
     /// ## Response messages (type 2)
-    /// 1. Procedure index (u32 in LE byte order)
-    /// 2. Call index (u32 in LE byte order)
-    /// 3. Whether or not this message is the last in its series (0 or 1 as u8; interpret as 0 = false, else true)
-    /// 4. Number of message bytes to expect (u32 in LE byte order)
+    /// 1. Multiflag (3 2-bit integers for sizings of next three steps, 1 bit for terminator status, final bit empty)
+    /// 2. Procedure index (IpfiInteger in LE byte order)
+    /// 3. Call index (IpfiInteger in LE byte order)
+    /// 4. Number of message bytes to expect (IpfiInteger in LE byte order)
     /// 5. Raw message bytes
     ///
     /// If step 2 transmitted length zero, the given message index should be terminated.
@@ -781,46 +776,35 @@ impl<'b> Message<'b> {
             Self::Call {
                 procedure_idx,
                 call_idx,
-                args,
+                args: message,
                 terminator,
-            } => {
-                buf.write_all(&[1])?;
-                // Step 1
-                let procedure_idx = procedure_idx.0.to_le_bytes();
-                buf.write_all(&procedure_idx)?;
-                // Step 2
-                let call_idx = call_idx.0.to_le_bytes();
-                buf.write_all(&call_idx)?;
-                // Step 3
-                let terminator = &[if *terminator { 1u8 } else { 0u8 }];
-                buf.write_all(terminator)?;
-                // Step 4
-                let num_bytes = args.len() as u32;
-                let num_bytes = num_bytes.to_le_bytes();
-                buf.write_all(&num_bytes)?;
-                // Step 5 (only bother if it's not empty)
-                if !args.is_empty() {
-                    buf.write_all(args)?;
-                }
             }
-            Self::Response {
+            | Self::Response {
                 procedure_idx,
                 call_idx,
                 message,
                 terminator,
             } => {
-                buf.write_all(&[2])?;
+                match &self {
+                    Self::Call { .. } => buf.write_all(&[1])?,
+                    Self::Response { .. } => buf.write_all(&[2])?,
+                    _ => unreachable!(),
+                };
+
+                let procedure_idx = get_as_smallest_int(procedure_idx.0);
+                let call_idx = get_as_smallest_int(call_idx.0);
+                let num_bytes = get_as_smallest_int_from_usize(message.len());
+
                 // Step 1
-                let procedure_idx = procedure_idx.0.to_le_bytes();
-                buf.write_all(&procedure_idx)?;
+                let multiflag = make_multiflag(&procedure_idx, &call_idx, &num_bytes, *terminator);
+                buf.write_all(&[multiflag])?;
                 // Step 2
-                let call_idx = call_idx.0.to_le_bytes();
-                buf.write_all(&call_idx)?;
+                let procedure_idx = procedure_idx.to_le_bytes();
+                buf.write_all(&procedure_idx)?;
                 // Step 3
-                let terminator = &[if *terminator { 1u8 } else { 0u8 }];
-                buf.write_all(terminator)?;
+                let call_idx = call_idx.to_le_bytes();
+                buf.write_all(&call_idx)?;
                 // Step 4
-                let num_bytes = message.len() as u32;
                 let num_bytes = num_bytes.to_le_bytes();
                 buf.write_all(&num_bytes)?;
                 // Step 5 (only bother if it's not empty)
@@ -837,10 +821,51 @@ impl<'b> Message<'b> {
     }
 }
 
+/// Creates a one-byte multiflag containing metadata about a message.
+fn make_multiflag(
+    procedure_idx: &Integer,
+    call_idx: &Integer,
+    num_bytes: &Integer,
+    is_terminator: bool,
+) -> u8 {
+    let flag_1 = procedure_idx.to_flag();
+    let flag_2 = call_idx.to_flag();
+    let flag_3 = num_bytes.to_flag();
+
+    let bool_arr = [
+        flag_1.0,
+        flag_1.1,
+        flag_2.0,
+        flag_2.1,
+        flag_3.0,
+        flag_3.1,
+        is_terminator,
+        false,
+    ];
+    bool_array_to_u8(&bool_arr)
+}
+
+fn bool_array_to_u8(arr: &[bool]) -> u8 {
+    let mut result: u8 = 0;
+    for (i, &bit) in arr.iter().enumerate() {
+        if bit {
+            result |= 1 << i;
+        }
+    }
+    result
+}
+fn u8_to_bool_array(value: u8) -> [bool; 8] {
+    let mut result: [bool; 8] = [false; 8];
+    for (i, item) in result.iter_mut().enumerate() {
+        *item = (value >> i) & 1 != 0;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::Wire;
-    use crate::{Interface, ProcedureIndex};
+    use crate::{Interface, IpfiInteger, ProcedureIndex};
     use std::io::Cursor;
 
     struct Actor {
@@ -941,7 +966,7 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn no_args_procedure_call_should_work() {
-        fn procedure(_: ()) -> u32 {
+        fn procedure(_: ()) -> IpfiInteger {
             42
         }
         let mut host = Actor::new();
@@ -966,7 +991,7 @@ mod tests {
         for _ in 0..2 {
             assert!(module.wire.receive_one(&mut module.input).is_ok());
         }
-        let result = handle.wait::<u32>();
+        let result = handle.wait::<IpfiInteger>();
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42);
     }

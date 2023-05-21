@@ -1,5 +1,6 @@
 #[cfg(feature = "serde")]
 use crate::procedure_args::Tuple;
+use crate::IpfiInteger;
 use crate::{complete_lock::CompleteLock, error::Error, roi_queue::RoiQueue};
 use dashmap::DashMap;
 #[cfg(feature = "serde")]
@@ -12,20 +13,20 @@ use serde::{de::DeserializeOwned, Serialize};
 ///
 /// For information about call indices, see [`Wire`].
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct CallIndex(pub(crate) u32);
+pub struct CallIndex(pub(crate) IpfiInteger);
 /// A procedure index. This is its own type to avoid confusion.
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct ProcedureIndex(pub(crate) u32);
+pub struct ProcedureIndex(pub(crate) IpfiInteger);
 // Users need to be able to construct these manually
 impl ProcedureIndex {
     /// Creates a new procedure index as given.
-    pub fn new(idx: u32) -> Self {
+    pub fn new(idx: IpfiInteger) -> Self {
         Self(idx)
     }
 }
 /// An identifier for a wire.
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct WireId(pub(crate) u32);
+pub struct WireId(pub(crate) IpfiInteger);
 
 /// A procedure registered on an interface.
 pub struct Procedure {
@@ -51,17 +52,17 @@ pub struct Procedure {
 /// messages. Once a message is accumulated, it will be stored in the buffer until the interface is
 /// dropped.
 pub struct Interface {
-    /// The messages received over the interface. This is implemented as a concurrent hash map indexed by a `u32`,
+    /// The messages received over the interface. This is implemented as a concurrent hash map indexed by a `IpfiInteger`,
     /// which means that, when a message is read, we can remove its entry from the map entirely and its identifier can
     /// be relinquished into a reuse-or-increment queue.
-    messages: DashMap<u32, (Vec<u8>, CompleteLock)>,
+    messages: DashMap<IpfiInteger, (Vec<u8>, CompleteLock)>,
     /// A queue that produces unique message identifiers while allowing us to recycle old ones. This enables far greater
     /// memory efficiency.
     message_id_queue: RoiQueue,
     /// A record of locks used to wait on the existence of a certain message
     /// index. Since multiple threads could simultaneously wait for different message
     /// indices, this has to be implemented this way!
-    creation_locks: DashMap<u32, CompleteLock>,
+    creation_locks: DashMap<IpfiInteger, CompleteLock>,
     /// A list of procedures registered on this interface that those communicating with this
     /// program may execute.
     procedures: DashMap<ProcedureIndex, Procedure>,
@@ -72,7 +73,7 @@ pub struct Interface {
     /// as necessary.
     ///
     /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
-    call_to_buffer_map: DashMap<(ProcedureIndex, CallIndex, WireId), u32>,
+    call_to_buffer_map: DashMap<(ProcedureIndex, CallIndex, WireId), IpfiInteger>,
     /// A queue that produces unique identifiers for the next wire that connects to this interface. Wire identifiers
     /// are needed to ensure that call indices, which h may be the same across multiple wires, are kept separate from
     /// each other. This queue will automatically recirculate relinquished identifiers.
@@ -131,7 +132,7 @@ impl Interface {
         R: Serialize + DeserializeOwned,
     >(
         &self,
-        idx: u32,
+        idx: IpfiInteger,
         f: impl Fn(A) -> R + Send + Sync + 'static,
     ) {
         let closure = Box::new(move |data: &[u8]| {
@@ -163,7 +164,7 @@ impl Interface {
     /// bytes and pass them straight to you, performing no intermediary steps.
     pub fn add_raw_procedure(
         &self,
-        idx: u32,
+        idx: IpfiInteger,
         f: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
     ) {
         // We only need to wrap the result in `Ok(..)`
@@ -225,7 +226,7 @@ impl Interface {
         procedure_idx: ProcedureIndex,
         call_idx: CallIndex,
         wire_id: WireId,
-    ) -> u32 {
+    ) -> IpfiInteger {
         let buf_idx = if let Some(buf_idx) =
             self.call_to_buffer_map
                 .get(&(procedure_idx, call_idx, wire_id))
@@ -242,7 +243,7 @@ impl Interface {
     }
     /// Allocates space for a new message buffer, creating a new completion lock.
     /// This will also mark a relevant creation lock as completed if one exists.
-    pub fn push(&self) -> u32 {
+    pub fn push(&self) -> IpfiInteger {
         let new_id = self.message_id_queue.get();
         self.messages
             .insert(new_id, (Vec::new(), CompleteLock::new()));
@@ -256,7 +257,7 @@ impl Interface {
     }
     /// Deletes the given message buffer and relinquishes its unique identifier back into
     /// the queue for reuse. This must be provided an ID that was previously issued by `.push()`.
-    fn pop(&self, id: u32) -> Option<(Vec<u8>, CompleteLock)> {
+    fn pop(&self, id: IpfiInteger) -> Option<(Vec<u8>, CompleteLock)> {
         if let Some((_id, val)) = self.messages.remove(&id) {
             self.message_id_queue.relinquish(id);
             Some(val)
@@ -277,7 +278,7 @@ impl Interface {
     /// This will fail if the message with the given identifier had already been completed, or it did not exist.
     /// Either of these cases can be trivially caused by a malicious client, and the caller should therefore be
     /// careful in how it handles these errors.
-    pub fn send(&self, datum: i8, message_id: u32) -> Result<bool, Error> {
+    pub fn send(&self, datum: i8, message_id: IpfiInteger) -> Result<bool, Error> {
         if let Some(mut m) = self.messages.get_mut(&message_id) {
             let (message, complete_lock) = m.value_mut();
             if complete_lock.completed() {
@@ -296,7 +297,7 @@ impl Interface {
     /// Sends many bytes through to the interface. When you have many bytes instead of just one at a time, this
     /// method should be preferred. Note that this method will not allow the termination of a message, and that should
     /// be handled separately.
-    pub fn send_many(&self, data: &[u8], message_id: u32) -> Result<(), Error> {
+    pub fn send_many(&self, data: &[u8], message_id: IpfiInteger) -> Result<(), Error> {
         if let Some(mut m) = self.messages.get_mut(&message_id) {
             let (message, complete_lock) = m.value_mut();
             if complete_lock.completed() {
@@ -311,7 +312,7 @@ impl Interface {
     }
     /// Explicitly terminates the message with the given index. This will return an error if the message
     /// has already been terminated or if it was out-of-bounds.
-    pub fn terminate_message(&self, message_id: u32) -> Result<(), Error> {
+    pub fn terminate_message(&self, message_id: IpfiInteger) -> Result<(), Error> {
         if let Some(mut m) = self.messages.get_mut(&message_id) {
             let (_message, complete_lock) = m.value_mut();
             if complete_lock.completed() {
@@ -332,7 +333,7 @@ impl Interface {
     /// available for future messages or procedure call metadata. This means that requesting the same message
     /// index may yield completely different data.
     #[cfg(feature = "serde")]
-    pub fn get<T: DeserializeOwned>(&self, message: u32) -> Result<T, Error> {
+    pub fn get<T: DeserializeOwned>(&self, message: IpfiInteger) -> Result<T, Error> {
         let message = self.get_raw(message);
         let decoded = rmp_serde::decode::from_slice(&message)?;
         Ok(decoded)
@@ -345,7 +346,7 @@ impl Interface {
     /// Note that this method will extract the underlying message from the given buffer index, leaving it
     /// available for future messages or procedure call metadata. This means that requesting the same message
     /// index may yield completely different data.
-    pub fn get_raw(&self, message_id: u32) -> Vec<u8> {
+    pub fn get_raw(&self, message_id: IpfiInteger) -> Vec<u8> {
         // We need two completion locks to be ready before we're ready: the first is
         // a creation lock on the message index, and the second is a lock on its
         // actual completion. We'll start by creating a new completion lock if one
