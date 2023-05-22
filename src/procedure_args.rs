@@ -1,5 +1,5 @@
 use crate::error::Error;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::Serialize;
 
 /// A trait that represents the arguments to a remote procedure. This is predominantly for
 /// convenience, and largely from [here](https://docs.rs/rhai/latest/src/rhai/func/args.rs.html#14-60).

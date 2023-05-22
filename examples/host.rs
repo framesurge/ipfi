@@ -40,15 +40,11 @@ fn main() {
     wire.start(module.stdout.take().unwrap(), module.stdin.take().unwrap());
 
     // IPFI is based on procedure calls, so we'll call some from the module now
-    let first_name_handle = wire
-        .call(ProcedureIndex::new(1), ("John".to_string(),))
-        .unwrap();
+    let first_name_handle = wire.call(ProcedureIndex::new(1), ("John",)).unwrap();
     // We wait here to show how Wasm is different to non-Wasm in terms of response grouping, purely for educational
     // purposes
     std::thread::sleep(std::time::Duration::from_secs(1));
-    let last_name_handle = wire
-        .call(ProcedureIndex::new(2), ("Doe".to_string(),))
-        .unwrap();
+    let last_name_handle = wire.call(ProcedureIndex::new(2), ("Doe",)).unwrap();
 
     // This procedure takes no arguments at all
     let magic_number_handle = wire.call(ProcedureIndex::new(0), ()).unwrap();

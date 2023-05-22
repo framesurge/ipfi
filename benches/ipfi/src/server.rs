@@ -15,7 +15,7 @@ static INTERFACE: Lazy<Interface> = Lazy::new(|| {
 
 /// The maximum length of time for which a single read operation can block. If this is reached by any
 /// read operation in IPFI, all subsequent reads will fail, meaning this will not be compounded.
-const TCP_READ_TIMEOUT: u64 = 5;
+const TCP_READ_TIMEOUT: u64 = 5; // Milliseconds
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:8000")?;
@@ -32,9 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Since this is a server, we disable unnecessary functionality to reduce attack surface and improve security
                 let wire = Wire::new_module(&INTERFACE);
                 // Read everything the user sends, responding to their queries
+                //
+                // Any attacks relying on holding this up can't hold it up for more than 5ms, and then we'll keep going,
+                // probably with valid responses to any actual procedure calls
                 let _ = wire.fill(&mut stream);
                 // And flush all our responses thereto
                 let _ = wire.flush(&mut stream);
+                // We don't use end-of-input because we aren't going to maybe keep going later, this is the end of this
+                // wire
                 let _ = signal_termination(&mut stream);
 
                 // Terminate the stream neatly
