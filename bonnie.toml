@@ -14,3 +14,9 @@ bench.cmd = [
     "cargo run -- %num_runs"
 ]
 bench.args = [ "num_runs" ]
+
+release = [
+    # We allow specifying a custom version for pre-releases
+    "standard-version --sign --commit-all %%",
+    "git push --follow-tags origin main"
+]
