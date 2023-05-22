@@ -15,7 +15,6 @@ crossbeam-queue = "0.3"
 
 [dev-dependencies]
 once_cell = "1"
-rayon = "1"
 
 [features]
 default = [ "wire", "serde", "int-u16" ]
@@ -29,3 +28,8 @@ int-u8 = []
 int-u16 = []
 int-u32 = []
 int-u64 = []
+
+[workspace]
+members = [
+    "benches/*"
+]

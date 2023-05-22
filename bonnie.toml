@@ -9,3 +9,19 @@ run.subcommands.wasm = [
     "cargo build --example module --target wasm32-wasi",
     "cargo run --example host -- target/wasm32-wasi/debug/examples/module.wasm true"
 ]
+
+[scripts.bench.subcommands]
+grpc = [
+     "cd benches/grpc",
+     "cargo build --bin grpc-bench-server --release",
+     "cargo build --bin grpc-bench-client --release",
+     "cd ../..",
+     "concurrently \"target/release/grpc-bench-server\" \"target/release/grpc-bench-client\""
+]
+ipfi = [
+     "cd benches/ipfi",
+     "cargo build --bin ipfi-bench-server --release",
+     "cargo build --bin ipfi-bench-client --release",
+     "cd ../..",
+     "concurrently \"target/release/ipfi-bench-server\" \"target/release/ipfi-bench-client\""
+]

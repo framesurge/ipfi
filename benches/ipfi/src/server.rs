@@ -8,7 +8,7 @@ use std::{
 
 static INTERFACE: Lazy<Interface> = Lazy::new(|| {
     let interface = Interface::new();
-    interface.add_procedure(0, |(name,): (String,)| format!("Hello there, {}!", name));
+    interface.add_procedure(0, |(name,): (String,)| format!("Hello, {}!", name));
 
     interface
 });
