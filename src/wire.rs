@@ -114,7 +114,7 @@ impl Wire<'static> {
         let self_writer = self.clone();
         let writer = std::thread::spawn(move || {
             // TODO Spinning...
-            while self_writer.flush(&mut writer).is_ok() {
+            while self_writer.flush_partial(&mut writer).is_ok() {
                 std::hint::spin_loop();
             }
         });
@@ -554,7 +554,10 @@ impl<'a> Wire<'a> {
     }
 
     /// Writes all messages currently in the internal write queue to the given output stream.
-    pub fn flush(&self, writer: &mut impl Write) -> Result<(), Error> {
+    ///
+    /// This is named `.flush_partial()` to make clear that this is usually not sufficient, and that an end-of-input
+    /// message needs to be sent first! To combine these two calls, use `.flush_end()`.
+    pub fn flush_partial(&self, writer: &mut impl Write) -> Result<(), Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -566,6 +569,42 @@ impl<'a> Wire<'a> {
         writer.flush()?;
 
         Ok(())
+    }
+    /// Flushes everything that has been written to this wire, along with an end-of-input message. This does *not* terminate
+    /// the wire, it merely states that we've written everything we can for now. In programs with a ping-pong structure (e.g.
+    /// Alice calls a method and waits for a response from Bob), this is what you would use when you're done with the ping and
+    /// waiting for the pong.
+    ///
+    /// Internally, this simply combines `.signal_end_of_input()` and `.flush_partial()`.
+    pub fn flush_end(&self, writer: &mut impl Write) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
+        self.signal_end_of_input()?;
+        self.flush_partial(writer)
+    }
+    /// Flushes everything that has been written to this wire, along with a termination signal, which tells the remote that your
+    /// program is now terminating, and that this wire has been rendered invalid. If your program may send further data later, you
+    /// should use `.flush_end()` instead, which sends a temporary end-of-input message. You can imagine the difference between
+    /// the two as `.flush_end()` being 'over' and this method being 'over and out' (which, in real radio communication, would
+    /// actually just be 'out').
+    ///
+    /// **IMPORTANT:** Never call this while waiting for a response, such as to a function call! Once the other side receives a
+    /// termination signal, it will immediately self-poison, causing *all* future method calls on their wire to fail. In many
+    /// cases, you won't actually need a termination signal, such as if you know the structure of both programs involved, and
+    /// you know what messages they'll send to each other. A termination signal is used to literally force the other program to
+    /// stop sending data. To see how this poison impacts the wire, look at the source code and the little preamble before every
+    /// single method: if the wire has terminated, they willall immediately fail! Call this only when communicating with an
+    /// unknown or untrusted program, but keeping in mind that they could easily ignore the termination signal (i.e. this cannot
+    /// be used as a superficial measure).
+    pub fn flush_terminate(&self, writer: &mut impl Write) -> Result<(), Error> {
+        if self.is_terminated() {
+            return Err(Error::WireTerminated);
+        }
+
+        self.signal_termination()?;
+        self.flush_partial(writer)
     }
     /// An ergonomic equivalent of `.receive_one()` that receives messages until either an error occurs, or until the remote program
     /// sends a manual end-of-input signal (with `.signal_end_of_input()`). This should only be used in single-threaded scenarios
@@ -603,7 +642,7 @@ impl<'a> Wire<'a> {
         }
     }
     /// Writes a manual end-of-input signal to the output, which, when flushed (potentially automatically if you've called `wire.start()`),
-    /// will cause any `wire.fill()` calls in the remote program to return `Ok(false)`, which can be checked for termination. This is
+    /// will cause any `wire.fill()` calls in the remote program to return `None`, which can be checked for termination. This is
     /// necessary when communicating with single-threaded programs, which must read all their input at once, to tell them to stop reading
     /// and start doing other work. This does not signal the termination of the wire, or even that there will not be any input in future,
     /// it simply allows you to signal to the remote that it should start doing something else. Internally, the reception of this case is
@@ -618,9 +657,9 @@ impl<'a> Wire<'a> {
     /// Writes a termination signal to the output, which will permanently neuter this connection, and all further operations on this wire
     /// will fail.
     ///
-    /// Generally, [`signal_termination`] should be preferred by single-threaded programs, although multi-threaded programs will typically
-    /// use `.start()`, which takes ownership of the writer that has to be used to signal termination. This method can be combined with
-    /// `.start()` to avoid such pitfalls. In short, use this if you're using `wire.open()` as well, otherwise use [`signal_termination`].
+    /// This does a similar thing to [`signal_termination`], except that this also requires flushing, and it can be more useful if `wire.open`
+    /// has consumed the writer handle. However, if you need to send a termination signal when your program shuts down after any errors,
+    /// [`signal_termination`] should be preferred.
     pub fn signal_termination(&self) -> Result<(), std::io::Error> {
         let msg = Message::Termination;
         let bytes = msg.to_bytes()?;
@@ -867,7 +906,7 @@ fn u8_to_bool_array(value: u8) -> [bool; 8] {
 #[cfg(test)]
 mod tests {
     use super::Wire;
-    use crate::{Interface, IpfiInteger, ProcedureIndex};
+    use crate::{Interface, ProcedureIndex};
     use std::io::Cursor;
 
     struct Actor {
@@ -905,15 +944,13 @@ mod tests {
         assert!(handle.is_ok());
 
         // Bob signals that he's done and sends everything he has to Alice
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0); // Test only
 
         // Alice reads until end-of-input and responds to everything she finds
         alice.wire.fill(&mut alice.input).unwrap();
         // Alice signals she's done and sends everything she has to Bob
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0); // Test only
 
         // Bob likewise reads until he has everything he needs
@@ -944,12 +981,10 @@ mod tests {
             .end_given_call(ProcedureIndex(0), call_idx)
             .unwrap();
 
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0);
         alice.wire.fill(&mut alice.input).unwrap();
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0);
         bob.wire.fill(&mut bob.input).unwrap();
 
@@ -971,12 +1006,10 @@ mod tests {
             .end_given_call(ProcedureIndex(0), call_idx)
             .unwrap();
 
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0);
         alice.wire.fill(&mut alice.input).unwrap();
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0);
         bob.wire.fill(&mut bob.input).unwrap();
 
@@ -1012,15 +1045,13 @@ mod tests {
         assert!(handle.is_ok());
 
         // Bob signals that he's done and sends everything he has to Alice
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0); // Test only
 
         // Alice reads until end-of-input and responds to everything she finds
         alice.wire.fill(&mut alice.input).unwrap();
         // Alice signals she's done and sends everything she has to Bob
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0); // Test only
 
         // Bob likewise reads until he has everything he needs
@@ -1055,14 +1086,12 @@ mod tests {
             .is_ok());
 
         // Bob signals that he's done and sends everything he has to Alice
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0); // Test only
 
         // Alice should still be fine (should have recycled indices on her end)
         assert!(alice.wire.fill(&mut alice.input).is_ok());
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0);
         bob.wire.fill(&mut bob.input).unwrap();
 
@@ -1084,12 +1113,10 @@ mod tests {
         let handle = bob.wire.call(ProcedureIndex(0), ("John", "Doe"));
         assert!(handle.is_ok());
 
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0);
         alice.wire.fill(&mut alice.input).unwrap();
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0);
         bob.wire.fill(&mut bob.input).unwrap();
 
@@ -1112,12 +1139,10 @@ mod tests {
         let handle = bob.wire.call(ProcedureIndex(0), ("John", "Doe"));
         assert!(handle.is_ok());
 
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0);
         alice.wire.fill(&mut alice.input).unwrap();
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0);
         bob.wire.fill(&mut bob.input).unwrap();
 
@@ -1139,8 +1164,7 @@ mod tests {
         let handle = bob.wire.call(ProcedureIndex(0), (0, 1));
         assert!(handle.is_ok());
 
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0);
         // While attempting to respond, Alice should encounter an error
         assert!(alice.wire.fill(&mut alice.input).is_err());
@@ -1173,15 +1197,13 @@ mod tests {
         assert!(handle.is_ok());
 
         // Bob signals that he's done and sends everything he has to Alice
-        bob.wire.signal_end_of_input().unwrap();
-        bob.wire.flush(&mut alice.input).unwrap();
+        bob.wire.flush_end(&mut alice.input).unwrap();
         alice.input.set_position(0); // Test only
 
         // Alice reads until end-of-input and responds to everything she finds
         alice.wire.fill(&mut alice.input).unwrap();
         // Alice signals she's done and sends everything she has to Bob
-        alice.wire.signal_end_of_input().unwrap();
-        alice.wire.flush(&mut bob.input).unwrap();
+        alice.wire.flush_end(&mut bob.input).unwrap();
         bob.input.set_position(0); // Test only
 
         // Bob likewise reads until he has everything he needs

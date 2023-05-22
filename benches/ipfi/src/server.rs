@@ -1,4 +1,4 @@
-use ipfi::{signal_termination, Interface, Wire};
+use ipfi::{Interface, Wire};
 use once_cell::sync::Lazy;
 use rayon::ThreadPoolBuilder;
 use std::{
@@ -36,11 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Any attacks relying on holding this up can't hold it up for more than 5ms, and then we'll keep going,
                 // probably with valid responses to any actual procedure calls
                 let _ = wire.fill(&mut stream);
-                // And flush all our responses thereto
-                let _ = wire.flush(&mut stream);
-                // We don't use end-of-input because we aren't going to maybe keep going later, this is the end of this
-                // wire
-                let _ = signal_termination(&mut stream);
+                // And flush all our responses thereto, and we don't use end-of-input because we aren't going to maybe keep going
+                // later, this is the end of this wire
+                let _ = wire.flush_terminate(&mut stream);
 
                 // Terminate the stream neatly
                 let _ = stream.shutdown(Shutdown::Write);

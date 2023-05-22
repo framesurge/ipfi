@@ -38,7 +38,7 @@ fn main() {
         .unwrap();
     // Calling procedures involves first sending a call message, and then waiting for a response message,
     // but this function returns nothing, so we don't have to worry about that in this particular case
-    wire.flush(&mut std::io::stdout()).unwrap();
+    wire.flush_end(&mut std::io::stdout()).unwrap();
 }
 
 fn prepare() -> Wire<'static> {

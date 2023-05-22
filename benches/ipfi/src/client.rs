@@ -19,8 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // synchronous one at present.)
     let wire = Wire::new(&INTERFACE);
     let greeting_handle = wire.call(ProcedureIndex::new(0), ("John Doe".to_string(),))?;
-    wire.signal_end_of_input()?;
-    wire.flush(&mut stream)?;
+    wire.flush_end(&mut stream)?;
     wire.fill(&mut stream)?;
     let greeting: String = greeting_handle.wait()?;
     assert_eq!(greeting, "Hello, John Doe!");
