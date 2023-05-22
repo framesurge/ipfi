@@ -8,6 +8,6 @@ This uses code heavily from [Tonic's introductory tutorial](https://github.com/h
 
 |              | Connect time  | Call time     | Total time    |
 |:-------------|:--------------|:--------------|:--------------|
-| IPFI         | 29.5μs        | 124.8μs       | 154.8μs       |
-| gRPC         | 140.2μs       | 296.3μs       | 437.0μs       |
-| % Difference | 374.7% faster | 137.5% faster | 182.3% faster |
+| IPFI         | 29.1μs        | 120.9μs       | 150.5μs       |
+| gRPC         | 139.5μs       | 294.0μs       | 434.0μs       |
+| % Difference | 378.9% faster | 143.2% faster | 188.3% faster |

@@ -3,6 +3,8 @@ use crate::procedure_args::Tuple;
 use crate::IpfiInteger;
 use crate::{complete_lock::CompleteLock, error::Error, roi_queue::RoiQueue};
 use dashmap::DashMap;
+use fxhash::FxBuildHasher;
+use nohash_hasher::BuildNoHashHasher;
 #[cfg(feature = "serde")]
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -55,17 +57,17 @@ pub struct Interface {
     /// The messages received over the interface. This is implemented as a concurrent hash map indexed by a `IpfiInteger`,
     /// which means that, when a message is read, we can remove its entry from the map entirely and its identifier can
     /// be relinquished into a reuse-or-increment queue.
-    messages: DashMap<IpfiInteger, (Vec<u8>, CompleteLock)>,
+    messages: DashMap<IpfiInteger, (Vec<u8>, CompleteLock), BuildNoHashHasher<IpfiInteger>>,
     /// A queue that produces unique message identifiers while allowing us to recycle old ones. This enables far greater
     /// memory efficiency.
     message_id_queue: RoiQueue,
     /// A record of locks used to wait on the existence of a certain message
     /// index. Since multiple threads could simultaneously wait for different message
     /// indices, this has to be implemented this way!
-    creation_locks: DashMap<IpfiInteger, CompleteLock>,
+    creation_locks: DashMap<IpfiInteger, CompleteLock, BuildNoHashHasher<IpfiInteger>>,
     /// A list of procedures registered on this interface that those communicating with this
     /// program may execute.
-    procedures: DashMap<ProcedureIndex, Procedure>,
+    procedures: DashMap<ProcedureIndex, Procedure, BuildNoHashHasher<IpfiInteger>>,
     /// A map of procedure call indices and the wire IDs that produced them to local message buffer addresses.
     /// These are necessary because, when a program sends a partial procedure call, and then later completes it,
     /// we need to know that the two messages are part of the same call. On their side, the caller will maintain
@@ -73,7 +75,7 @@ pub struct Interface {
     /// as necessary.
     ///
     /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
-    call_to_buffer_map: DashMap<(ProcedureIndex, CallIndex, WireId), IpfiInteger>,
+    call_to_buffer_map: DashMap<(ProcedureIndex, CallIndex, WireId), IpfiInteger, FxBuildHasher>,
     /// A queue that produces unique identifiers for the next wire that connects to this interface. Wire identifiers
     /// are needed to ensure that call indices, which h may be the same across multiple wires, are kept separate from
     /// each other. This queue will automatically recirculate relinquished identifiers.
@@ -82,11 +84,11 @@ pub struct Interface {
 impl Default for Interface {
     fn default() -> Self {
         Self {
-            messages: DashMap::new(),
+            messages: DashMap::default(),
             message_id_queue: RoiQueue::new(),
-            creation_locks: DashMap::new(),
-            procedures: DashMap::new(),
-            call_to_buffer_map: DashMap::new(),
+            creation_locks: DashMap::default(),
+            procedures: DashMap::default(),
+            call_to_buffer_map: DashMap::default(),
             wire_id_queue: RoiQueue::new(),
         }
     }

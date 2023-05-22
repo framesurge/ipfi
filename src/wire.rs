@@ -8,6 +8,8 @@ use crate::{
 };
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
+use fxhash::FxBuildHasher;
+use nohash_hasher::BuildNoHashHasher;
 #[cfg(feature = "serde")]
 use serde::de::DeserializeOwned;
 use std::{
@@ -84,13 +86,13 @@ pub struct Wire<'a> {
     queue: Arc<SegQueue<Vec<u8>>>,
     /// A map that keeps track of how many times each remote procedure has been called, allowing call indices to be intelligently
     /// and largely internally handled.
-    remote_call_counter: Arc<DashMap<ProcedureIndex, IpfiInteger>>,
+    remote_call_counter: Arc<DashMap<ProcedureIndex, IpfiInteger, BuildNoHashHasher<IpfiInteger>>>,
     /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed until
     /// it is removed.
     ///
     /// This serves as a secuirty mechanism to ensure that response messages are mapped *locally* to response buffer indices, which means we can be sure
     /// that a remote cannot access and control arbitrary message buffers on our local interface, thereby compromising other wires.
-    response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), IpfiInteger>>,
+    response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), IpfiInteger, FxBuildHasher>>,
     /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
     terminated: Arc<AtomicBool>,
 }
@@ -141,8 +143,8 @@ impl<'a> Wire<'a> {
             interface,
             module_style: false,
             queue: Arc::new(SegQueue::new()),
-            remote_call_counter: Arc::new(DashMap::new()),
-            response_idx_map: Arc::new(DashMap::new()),
+            remote_call_counter: Arc::new(DashMap::default()),
+            response_idx_map: Arc::new(DashMap::default()),
 
             // If we detect an EOF, this will be set
             terminated: Arc::new(AtomicBool::new(false)),
@@ -157,8 +159,8 @@ impl<'a> Wire<'a> {
             interface,
             module_style: true,
             queue: Arc::new(SegQueue::new()),
-            remote_call_counter: Arc::new(DashMap::new()),
-            response_idx_map: Arc::new(DashMap::new()),
+            remote_call_counter: Arc::new(DashMap::default()),
+            response_idx_map: Arc::new(DashMap::default()),
 
             // If we detect an EOF, this will be set
             terminated: Arc::new(AtomicBool::new(false)),
