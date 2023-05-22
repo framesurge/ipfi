@@ -49,26 +49,7 @@ fn calc_percent_differential(old: f64, new: f64) -> f64 {
 }
 
 fn bench_avg(name: &str, times: usize) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
-    let mut avg = bench_program(name)?;
-    for i in 0..(times - 1) {
-        let m = bench_program(name)?;
-        for (k, curr_avg) in avg.iter_mut() {
-            let new_val = m
-                .get(k)
-                .expect("metric disparity (different runs of same program)");
-            *curr_avg = update_avg(*curr_avg, i, *new_val);
-        }
-    }
-
-    Ok(avg)
-}
-
-fn update_avg(curr_avg: f64, num_elems: usize, new_elem: f64) -> f64 {
-    (curr_avg * num_elems as f64 + new_elem) / (num_elems as f64 + 1.0)
-}
-
-fn bench_program(name: &str) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
-    // Build the server and client
+    // Build the server and client once at the start
     let server_build = Command::new("cargo")
         .args(&[
             "build",
@@ -92,14 +73,34 @@ fn bench_program(name: &str) -> Result<HashMap<String, f64>, Box<dyn std::error:
     } else if !client_build.status.success() {
         return Err("failed to build client".into());
     }
-
     // Start running the server
     let mut server = Command::new(&format!("target/release/{}-bench-server", name)).spawn()?;
     // Give the server time to start up
-    std::thread::sleep(std::time::Duration::from_millis(1000));
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    let mut avg = bench_program(name)?;
+    for i in 0..(times - 1) {
+        let m = bench_program(name)?;
+        for (k, curr_avg) in avg.iter_mut() {
+            let new_val = m
+                .get(k)
+                .expect("metric disparity (different runs of same program)");
+            *curr_avg = update_avg(*curr_avg, i, *new_val);
+        }
+    }
+
+    server.kill()?;
+
+    Ok(avg)
+}
+
+fn update_avg(curr_avg: f64, num_elems: usize, new_elem: f64) -> f64 {
+    (curr_avg * num_elems as f64 + new_elem) / (num_elems as f64 + 1.0)
+}
+
+fn bench_program(name: &str) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
     let client_output = Command::new(&format!("target/release/{}-bench-client", name)).output()?;
     let client_output = String::from_utf8(client_output.stdout)?;
-    server.kill()?;
 
     let mut metrics = HashMap::new();
     for line in client_output.lines() {
@@ -114,12 +115,6 @@ fn bench_program(name: &str) -> Result<HashMap<String, f64>, Box<dyn std::error:
 
         metrics.insert(k.to_string(), v_num);
     }
-
-    // let metrics = Metrics {
-    //     total_time: *metrics.get("total_time").unwrap(),
-    //     call_time: *metrics.get("call_time").unwrap(),
-    //     connect_time: *metrics.get("connect_time").unwrap(),
-    // };
 
     Ok(metrics)
 }
