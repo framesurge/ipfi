@@ -9,7 +9,7 @@ pub trait ProcedureArgs {
     fn into_bytes(self) -> Result<Vec<u8>, Error>;
 }
 
-impl<T: Serialize + DeserializeOwned> ProcedureArgs for Vec<T> {
+impl<T: Serialize> ProcedureArgs for Vec<T> {
     fn into_bytes(self) -> Result<Vec<u8>, Error> {
         let mut data = Vec::new();
         for elem in self {
@@ -20,7 +20,7 @@ impl<T: Serialize + DeserializeOwned> ProcedureArgs for Vec<T> {
     }
 }
 
-impl<T: Serialize + DeserializeOwned, const N: usize> ProcedureArgs for [T; N] {
+impl<T: Serialize, const N: usize> ProcedureArgs for [T; N] {
     #[inline]
     fn into_bytes(self) -> Result<Vec<u8>, Error> {
         let mut data = Vec::new();
@@ -35,7 +35,7 @@ impl<T: Serialize + DeserializeOwned, const N: usize> ProcedureArgs for [T; N] {
 /// Macro to implement [`ProcedureArgs`] for tuples of standard types (each can be converted into bytes).
 macro_rules! impl_args {
     ($($p:ident),*) => {
-        impl<$($p: Serialize + DeserializeOwned),*> ProcedureArgs for ($($p,)*)
+        impl<$($p: Serialize),*> ProcedureArgs for ($($p,)*)
         {
             #[inline]
             fn into_bytes(self) -> Result<Vec<u8>, Error> {
@@ -70,7 +70,7 @@ pub trait Tuple {
 }
 macro_rules! impl_tuple {
     ($($p:ident),*) => {
-        impl<$($p: Serialize + DeserializeOwned),*> Tuple for ($($p,)*)
+        impl<$($p: Serialize),*> Tuple for ($($p,)*)
         {
             #[inline]
             fn len() -> u32 {
