@@ -923,6 +923,67 @@ mod tests {
         assert_eq!(result, [0, 1, 2, 3, 42]);
     }
     #[test]
+    fn two_bytes_calls_should_use_correct_call_indices() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        alice.interface.add_raw_procedure(0, |bytes| {
+            let mut bytes = bytes.to_vec();
+            bytes.extend([42]);
+
+            bytes
+        });
+
+        // First call
+        let call_idx = bob
+            .wire
+            .start_call_with_partial_bytes(ProcedureIndex(0), &[0, 1, 2, 3])
+            .unwrap();
+        assert_eq!(call_idx.0, 0);
+        let handle = bob
+            .wire
+            .end_given_call(ProcedureIndex(0), call_idx)
+            .unwrap();
+
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0);
+        alice.wire.fill(&mut alice.input).unwrap();
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0);
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.wait_bytes();
+        assert_eq!(result, [0, 1, 2, 3, 42]);
+
+        // Test cleanup
+        alice.input = Cursor::new(Vec::new());
+        bob.input = Cursor::new(Vec::new());
+
+        // Second call
+        let call_idx = bob
+            .wire
+            .start_call_with_partial_bytes(ProcedureIndex(0), &[0, 1, 2, 3])
+            .unwrap();
+        assert_eq!(call_idx.0, 1);
+        let handle = bob
+            .wire
+            .end_given_call(ProcedureIndex(0), call_idx)
+            .unwrap();
+
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0);
+        alice.wire.fill(&mut alice.input).unwrap();
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0);
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.wait_bytes();
+        assert_eq!(result, [0, 1, 2, 3, 42]);
+    }
+    #[test]
     fn partial_bytes_call_should_work() {
         let mut alice = Actor::new();
         let mut bob = Actor::new();
