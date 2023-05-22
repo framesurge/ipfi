@@ -1,6 +1,6 @@
 # Interplanetary Function Interface (IPFI)
 
-> ⚠ IPFI is currently under highly active development, and has not yet been formally released. Check back here for updates!
+> ⚠ IPFI is currently in early beta, and some features may change as we round things off! The library is usable, but there may be a few issues.
 
 IPFI is a Rust-based inter-process communication tool to allow programs running over the wackiest interfaces under the sun to effectively talk to each other and get stuff done collaboratively. It was designed for a build server for [a Rust web framework](https://github.com/framesurge/perseus) that needs to work with code from potentially any programming language.
 
