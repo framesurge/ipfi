@@ -885,8 +885,249 @@ mod tests {
                 input: Cursor::new(Vec::new()),
             }
         }
-        fn reset_input(&mut self) {
-            self.input.set_position(0);
-        }
+    }
+
+    // We can only really tests synchronous calls without a ton of extra *stuff*, which is unrealistic anyway because
+    // half the time we'll be using stdio and the other half tcp (that's why the examples exist!)
+    #[test]
+    fn sync_oneshot_byte_call_should_work() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        // A function that adds `42` to the end of a byte stream
+        alice.interface.add_raw_procedure(0, |bytes| {
+            let mut bytes = bytes.to_vec();
+            bytes.extend([42]);
+
+            bytes
+        });
+
+        let handle = bob.wire.call_with_bytes(ProcedureIndex(0), &[0, 1, 2, 3]);
+        assert!(handle.is_ok());
+
+        // Bob signals that he's done and sends everything he has to Alice
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0); // Test only
+
+        // Alice reads until end-of-input and responds to everything she finds
+        alice.wire.fill(&mut alice.input).unwrap();
+        // Alice signals she's done and sends everything she has to Bob
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0); // Test only
+
+        // Bob likewise reads until he has everything he needs
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.unwrap().wait_bytes();
+        assert_eq!(result, [0, 1, 2, 3, 42]);
+    }
+    #[test]
+    fn partial_bytes_call_should_work() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        // A function that adds `42` to the end of a byte stream
+        alice.interface.add_raw_procedure(0, |bytes| {
+            let mut bytes = bytes.to_vec();
+            bytes.extend([42]);
+
+            bytes
+        });
+
+        let call_idx = bob
+            .wire
+            .start_call_with_partial_bytes(ProcedureIndex(0), &[0]);
+        assert!(call_idx.is_ok());
+        let call_idx = call_idx.unwrap();
+        // This should be the first time we've called the method
+        assert_eq!(call_idx.0, 0);
+        // Try continuing the call
+        assert!(bob
+            .wire
+            .continue_given_call_with_bytes(ProcedureIndex(0), call_idx, &[1, 2, 3])
+            .is_ok());
+        // And now try to end it
+        let handle = bob.wire.end_given_call(ProcedureIndex(0), call_idx);
+        assert!(handle.is_ok());
+
+        // Bob signals that he's done and sends everything he has to Alice
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0); // Test only
+
+        // Alice reads until end-of-input and responds to everything she finds
+        alice.wire.fill(&mut alice.input).unwrap();
+        // Alice signals she's done and sends everything she has to Bob
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0); // Test only
+
+        // Bob likewise reads until he has everything he needs
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.unwrap().wait_bytes();
+        assert_eq!(result, [0, 1, 2, 3, 42]);
+    }
+    #[test]
+    fn other_side_should_pick_up_send_after_end() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        // A function that adds `42` to the end of a byte stream
+        alice.interface.add_raw_procedure(0, |bytes| {
+            let mut bytes = bytes.to_vec();
+            bytes.extend([42]);
+
+            bytes
+        });
+
+        let call_idx = bob
+            .wire
+            .start_call_with_partial_bytes(ProcedureIndex(0), &[0, 1, 2, 3]);
+        assert!(call_idx.is_ok());
+        let call_idx = call_idx.unwrap();
+        let handle = bob.wire.end_given_call(ProcedureIndex(0), call_idx);
+        assert!(handle.is_ok());
+        // Try continuing the call (should work locally)
+        assert!(bob
+            .wire
+            .continue_given_call_with_bytes(ProcedureIndex(0), call_idx, &[1, 2, 3])
+            .is_ok());
+
+        // Bob signals that he's done and sends everything he has to Alice
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0); // Test only
+
+        // Alice should still be fine (should have recycled indices on her end)
+        assert!(alice.wire.fill(&mut alice.input).is_ok());
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0);
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.unwrap().wait_bytes();
+        assert_eq!(result, [0, 1, 2, 3, 42]);
+    }
+    #[cfg(feature = "serde")]
+    #[test]
+    fn oneshot_args_call_should_work() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        // A greeting procedure
+        alice
+            .interface
+            .add_procedure(0, |(first, last): (String, String)| {
+                format!("Hello, {first} {last}!")
+            });
+
+        let handle = bob.wire.call(ProcedureIndex(0), ("John", "Doe"));
+        assert!(handle.is_ok());
+
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0);
+        alice.wire.fill(&mut alice.input).unwrap();
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0);
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.unwrap().wait::<String>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Hello, John Doe!");
+    }
+    #[cfg(feature = "serde")]
+    #[test]
+    fn call_with_wrong_type_should_fail() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        // A greeting procedure
+        alice
+            .interface
+            .add_procedure(0, |(first, last): (String, String)| {
+                format!("Hello, {first} {last}!")
+            });
+
+        let handle = bob.wire.call(ProcedureIndex(0), ("John", "Doe"));
+        assert!(handle.is_ok());
+
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0);
+        alice.wire.fill(&mut alice.input).unwrap();
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0);
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.unwrap().wait::<u32>();
+        assert!(result.is_err());
+    }
+    #[cfg(feature = "serde")]
+    #[test]
+    fn call_with_wrong_arg_types_should_fail() {
+        let mut alice = Actor::new();
+        let bob = Actor::new();
+        // A greeting procedure
+        alice
+            .interface
+            .add_procedure(0, |(first, last): (String, String)| {
+                format!("Hello, {first} {last}!")
+            });
+
+        let handle = bob.wire.call(ProcedureIndex(0), (0, 1));
+        assert!(handle.is_ok());
+
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0);
+        // While attempting to respond, Alice should encounter an error
+        assert!(alice.wire.fill(&mut alice.input).is_err());
+    }
+    #[cfg(feature = "serde")]
+    #[test]
+    fn partial_args_call_should_work() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        alice
+            .interface
+            .add_procedure(0, |(first, last): (String, String)| {
+                format!("Hello, {first} {last}!")
+            });
+
+        let call_idx = bob
+            .wire
+            .start_call_with_partial_args(ProcedureIndex(0), ("John",));
+        assert!(call_idx.is_ok());
+        let call_idx = call_idx.unwrap();
+        // This should be the first time we've called the method
+        assert_eq!(call_idx.0, 0);
+        // Try continuing the call
+        assert!(bob
+            .wire
+            .continue_given_call_with_args(ProcedureIndex(0), call_idx, ("Doe",))
+            .is_ok());
+        // And now try to end it
+        let handle = bob.wire.end_given_call(ProcedureIndex(0), call_idx);
+        assert!(handle.is_ok());
+
+        // Bob signals that he's done and sends everything he has to Alice
+        bob.wire.signal_end_of_input().unwrap();
+        bob.wire.flush(&mut alice.input).unwrap();
+        alice.input.set_position(0); // Test only
+
+        // Alice reads until end-of-input and responds to everything she finds
+        alice.wire.fill(&mut alice.input).unwrap();
+        // Alice signals she's done and sends everything she has to Bob
+        alice.wire.signal_end_of_input().unwrap();
+        alice.wire.flush(&mut bob.input).unwrap();
+        bob.input.set_position(0); // Test only
+
+        // Bob likewise reads until he has everything he needs
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        let result = handle.unwrap().wait::<String>();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Hello, John Doe!");
     }
 }
