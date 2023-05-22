@@ -2,6 +2,13 @@
 name = "ipfi"
 version = "0.1.0-rc.1"
 edition = "2021"
+description = "The inter-planetary function interface: a lightning-fast RPC library that just works."
+authors = [ "arctic-hen7 <arctic.hen@pm.me>" ]
+license = "MIT"
+repository = "https://github.com/framesurge/ipfi"
+readme = "README.md"
+keywords = [ "rpc", "ffi", "ipfi", "concurrent", "ipc" ]
+categories = [ "encoding", "web-programming" ]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
