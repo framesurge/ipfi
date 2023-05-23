@@ -689,6 +689,8 @@ impl Drop for Wire<'_> {
 /// requires `.flush()` to be called, so waiting inside a function like `.call()` would make very little sense.
 // There is no point in making this `Clone` to avoid issues around dropping the wire, as the `'a` lifetime is what gets in
 // the way
+//
+// We keep the `.wait()` methods even in the async API because this determines type conversion
 #[must_use]
 pub struct CallHandle<'a> {
     /// The message index to wait for. If this is improperly initialised, we will probably get completely different and almost
