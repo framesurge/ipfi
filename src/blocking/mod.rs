@@ -1,0 +1,11 @@
+mod complete_lock;
+mod interface;
+#[cfg(feature = "wire")]
+mod wire;
+
+pub use interface::Interface;
+#[cfg(feature = "wire")]
+pub use wire::{signal_termination, AutonomousWireHandle, CallHandle, Wire};
+
+// Re-export these to avoid the user having to use two lines of imports for using the blocking API
+pub use crate::{ProcedureIndex, CallIndex, WireId};

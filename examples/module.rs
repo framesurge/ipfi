@@ -1,4 +1,4 @@
-use ipfi::{Interface, ProcedureIndex, Wire};
+use ipfi::blocking::{Interface, ProcedureIndex, Wire};
 use once_cell::sync::Lazy;
 
 /// The interface we hold with the host. This will be initialized when the program starts.

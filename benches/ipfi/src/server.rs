@@ -1,4 +1,4 @@
-use ipfi::{Interface, Wire};
+use ipfi::blocking::{Interface, Wire};
 use once_cell::sync::Lazy;
 use rayon::ThreadPoolBuilder;
 use std::{

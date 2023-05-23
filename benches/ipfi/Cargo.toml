@@ -12,6 +12,6 @@ name = "ipfi-bench-client"
 path = "src/client.rs"
 
 [dependencies]
-ipfi = { path = "../../", default-features = false, features = [ "wire", "serde", "int-u16" ] }
+ipfi = { path = "../../", default-features = false, features = [ "wire", "serde", "int-u16", "blocking" ] }
 once_cell = "1"
 rayon = "1"

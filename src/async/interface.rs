@@ -1,34 +1,14 @@
 #[cfg(feature = "serde")]
 use crate::procedure_args::Tuple;
-use crate::IpfiInteger;
-use crate::{complete_lock::CompleteLock, error::Error, roi_queue::RoiQueue};
+use crate::{IpfiInteger, ProcedureIndex, CallIndex, WireId};
+use crate::error::Error;
+use crate::roi_queue::RoiQueue;
+use super::complete_lock::CompleteLock;
 use dashmap::DashMap;
 use fxhash::FxBuildHasher;
 use nohash_hasher::BuildNoHashHasher;
 #[cfg(feature = "serde")]
 use serde::{de::DeserializeOwned, Serialize};
-
-// The following are newtype wrappers that can deliberately only be constructed internally to avoid confusion.
-// This also allows us to keep the internals as implementation details, and to change them without a breaking
-// change if necessary.
-/// A call index. This is its own type to avoid confusion.
-///
-/// For information about call indices, see [`Wire`].
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct CallIndex(pub(crate) IpfiInteger);
-/// A procedure index. This is its own type to avoid confusion.
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct ProcedureIndex(pub(crate) IpfiInteger);
-// Users need to be able to construct these manually
-impl ProcedureIndex {
-    /// Creates a new procedure index as given.
-    pub fn new(idx: IpfiInteger) -> Self {
-        Self(idx)
-    }
-}
-/// An identifier for a wire.
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct WireId(pub(crate) IpfiInteger);
 
 /// A procedure registered on an interface.
 pub struct Procedure {
@@ -181,21 +161,21 @@ impl Interface {
     ///
     /// There is no method provided to avoid byte serialization, because procedure calls over IPFI are intended to be made solely by
     /// remote communicators.
-    pub fn call_procedure(
+    pub async fn call_procedure(
         &self,
         procedure_idx: ProcedureIndex,
         call_idx: CallIndex,
         wire_id: WireId,
     ) -> Result<Vec<u8>, Error> {
         // Get the buffer where the arguments are supposed to be, and then delete that mapping to free up some space
-        let args_buf_idx = self.get_call_buffer(procedure_idx, call_idx, wire_id);
+        let args_buf_idx = self.get_call_buffer(procedure_idx, call_idx, wire_id).await;
         self.call_to_buffer_map
             .remove(&(procedure_idx, call_idx, wire_id));
 
         if let Some(procedure) = self.procedures.get(&procedure_idx) {
             if let Some(m) = self.messages.get(&args_buf_idx) {
                 let (args, complete_lock) = m.value();
-                if complete_lock.completed() {
+                if complete_lock.completed().await {
                     // The length marker will be inserted by the internal wrapper closure
                     let ret = (procedure.closure)(args);
                     // Success, relinquish this message buffer
@@ -223,7 +203,7 @@ impl Interface {
     /// This allows arguments to be accumulated piecemeal before the actual procedure call.
     ///
     /// This will create a buffer for this call if one doesn't already exist, and otherwise it will create one.
-    pub(crate) fn get_call_buffer(
+    pub(crate) async fn get_call_buffer(
         &self,
         procedure_idx: ProcedureIndex,
         call_idx: CallIndex,
@@ -235,7 +215,7 @@ impl Interface {
         {
             *buf_idx
         } else {
-            let new_idx = self.push();
+            let new_idx = self.push().await;
             self.call_to_buffer_map
                 .insert((procedure_idx, call_idx, wire_id), new_idx);
             new_idx
@@ -245,14 +225,14 @@ impl Interface {
     }
     /// Allocates space for a new message buffer, creating a new completion lock.
     /// This will also mark a relevant creation lock as completed if one exists.
-    pub fn push(&self) -> IpfiInteger {
+    pub async fn push(&self) -> IpfiInteger {
         let new_id = self.message_id_queue.get();
         self.messages
             .insert(new_id, (Vec::new(), CompleteLock::new()));
 
         // If anyone was waiting for this buffer to exist, it now does!
         if let Some(lock) = self.creation_locks.get_mut(&new_id) {
-            lock.mark_complete();
+            lock.mark_complete().await;
         }
 
         new_id
@@ -280,13 +260,13 @@ impl Interface {
     /// This will fail if the message with the given identifier had already been completed, or it did not exist.
     /// Either of these cases can be trivially caused by a malicious client, and the caller should therefore be
     /// careful in how it handles these errors.
-    pub fn send(&self, datum: i8, message_id: IpfiInteger) -> Result<bool, Error> {
+    pub async fn send(&self, datum: i8, message_id: IpfiInteger) -> Result<bool, Error> {
         if let Some(mut m) = self.messages.get_mut(&message_id) {
             let (message, complete_lock) = m.value_mut();
-            if complete_lock.completed() {
+            if complete_lock.completed().await {
                 Err(Error::AlreadyCompleted { index: message_id })
             } else if datum < 0 {
-                complete_lock.mark_complete();
+                complete_lock.mark_complete().await;
                 Ok(false)
             } else {
                 message.push(datum as u8);
@@ -299,10 +279,10 @@ impl Interface {
     /// Sends many bytes through to the interface. When you have many bytes instead of just one at a time, this
     /// method should be preferred. Note that this method will not allow the termination of a message, and that should
     /// be handled separately.
-    pub fn send_many(&self, data: &[u8], message_id: IpfiInteger) -> Result<(), Error> {
+    pub async fn send_many(&self, data: &[u8], message_id: IpfiInteger) -> Result<(), Error> {
         if let Some(mut m) = self.messages.get_mut(&message_id) {
             let (message, complete_lock) = m.value_mut();
-            if complete_lock.completed() {
+            if complete_lock.completed().await {
                 Err(Error::AlreadyCompleted { index: message_id })
             } else {
                 message.extend(data);
@@ -314,13 +294,13 @@ impl Interface {
     }
     /// Explicitly terminates the message with the given index. This will return an error if the message
     /// has already been terminated or if it was out-of-bounds.
-    pub fn terminate_message(&self, message_id: IpfiInteger) -> Result<(), Error> {
+    pub async fn terminate_message(&self, message_id: IpfiInteger) -> Result<(), Error> {
         if let Some(mut m) = self.messages.get_mut(&message_id) {
             let (_message, complete_lock) = m.value_mut();
-            if complete_lock.completed() {
+            if complete_lock.completed().await {
                 Err(Error::AlreadyCompleted { index: message_id })
             } else {
-                complete_lock.mark_complete();
+                complete_lock.mark_complete().await;
                 Ok(())
             }
         } else {
@@ -335,8 +315,8 @@ impl Interface {
     /// available for future messages or procedure call metadata. This means that requesting the same message
     /// index may yield completely different data.
     #[cfg(feature = "serde")]
-    pub fn get<T: DeserializeOwned>(&self, message: IpfiInteger) -> Result<T, Error> {
-        let message = self.get_raw(message);
+    pub async fn get<T: DeserializeOwned>(&self, message: IpfiInteger) -> Result<T, Error> {
+        let message = self.get_raw(message).await;
         let decoded = rmp_serde::decode::from_slice(&message)?;
         Ok(decoded)
     }
@@ -348,7 +328,7 @@ impl Interface {
     /// Note that this method will extract the underlying message from the given buffer index, leaving it
     /// available for future messages or procedure call metadata. This means that requesting the same message
     /// index may yield completely different data.
-    pub fn get_raw(&self, message_id: IpfiInteger) -> Vec<u8> {
+    pub async fn get_raw(&self, message_id: IpfiInteger) -> Vec<u8> {
         // We need two completion locks to be ready before we're ready: the first is
         // a creation lock on the message index, and the second is a lock on its
         // actual completion. We'll start by creating a new completion lock if one
@@ -367,7 +347,7 @@ impl Interface {
                     lock
                 };
 
-                lock.wait_for_completion();
+                lock.wait_for_completion().await;
                 // Now delete that lock to free up some space
                 // Note that our read-only creation locks instance will definitely have been dropped
                 // by this point
@@ -382,7 +362,7 @@ impl Interface {
             message.1.clone()
         };
 
-        message_lock.wait_for_completion();
+        message_lock.wait_for_completion().await;
 
         // This definitely exists if we got here (and it logically has to).
         // Note that this will also prepare the message identifier for reuse.
@@ -402,8 +382,8 @@ mod tests {
         vec.iter().any(|x| !set.insert(x))
     }
 
-    #[test]
-    fn wire_ids_should_be_unique() {
+    #[tokio::test]
+    async fn wire_ids_should_be_unique() {
         let interface = Interface::new();
         let mut ids = Vec::new();
         // We only loop up to here for `int-u8`
@@ -413,176 +393,176 @@ mod tests {
             ids.push(id);
         }
     }
-    #[test]
-    fn call_buffers_should_be_distinct() {
+    #[tokio::test]
+    async fn call_buffers_should_be_distinct() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0));
-        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1));
-        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(1), WireId(0));
-        let buf_4 = interface.get_call_buffer(ProcedureIndex(1), CallIndex(0), WireId(0));
+        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0)).await;
+        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1)).await;
+        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(1), WireId(0)).await;
+        let buf_4 = interface.get_call_buffer(ProcedureIndex(1), CallIndex(0), WireId(0)).await;
 
         assert!(!has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
     }
-    #[test]
-    fn call_buffers_should_be_reused() {
+    #[tokio::test]
+    async fn call_buffers_should_be_reused() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0));
-        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1));
-        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0));
-        let buf_4 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1));
+        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0)).await;
+        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1)).await;
+        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0)).await;
+        let buf_4 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1)).await;
 
         assert!(has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
         assert!(buf_1 == buf_3 && buf_2 == buf_4);
     }
-    #[test]
-    fn message_buf_allocs_should_not_overlap() {
+    #[tokio::test]
+    async fn message_buf_allocs_should_not_overlap() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = std::thread::spawn(|| interface.push());
-        let buf_2 = std::thread::spawn(|| interface.push());
-        let buf_3 = std::thread::spawn(|| interface.push());
-        let buf_4 = std::thread::spawn(|| interface.push());
+        let buf_1 = tokio::task::spawn(async { interface.push().await });
+        let buf_2 = tokio::task::spawn(async { interface.push().await });
+        let buf_3 = tokio::task::spawn(async { interface.push().await });
+        let buf_4 = tokio::task::spawn(async { interface.push().await });
 
-        let buf_1 = buf_1.join().unwrap();
-        let buf_2 = buf_2.join().unwrap();
-        let buf_3 = buf_3.join().unwrap();
-        let buf_4 = buf_4.join().unwrap();
+        let buf_1 = buf_1.await.unwrap();
+        let buf_2 = buf_2.await.unwrap();
+        let buf_3 = buf_3.await.unwrap();
+        let buf_4 = buf_4.await.unwrap();
 
         assert!(!has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
     }
-    #[test]
-    fn writing_to_msg_until_end_should_work() {
+    #[tokio::test]
+    async fn writing_to_msg_until_end_should_work() {
         let interface = Interface::new();
-        let id = interface.push();
+        let id = interface.push().await;
 
-        assert!(interface.send(0, id).is_ok());
-        assert!(interface.send(1, id).is_ok());
-        assert!(interface.send(2, id).is_ok());
-        assert!(interface.send(-1, id).is_ok());
+        assert!(interface.send(0, id).await.is_ok());
+        assert!(interface.send(1, id).await.is_ok());
+        assert!(interface.send(2, id).await.is_ok());
+        assert!(interface.send(-1, id).await.is_ok());
 
-        assert!(interface.send(0, id).is_err());
-        assert!(interface.send(-1, id).is_err());
+        assert!(interface.send(0, id).await.is_err());
+        assert!(interface.send(-1, id).await.is_err());
     }
-    #[test]
-    fn send_many_should_never_terminate() {
+    #[tokio::test]
+    async fn send_many_should_never_terminate() {
         let interface = Interface::new();
-        let id = interface.push();
+        let id = interface.push().await;
 
-        assert!(interface.send_many(&[0, 0, 1, 3, 2, 5, 12], id).is_ok());
-        assert!(interface.send_many(&[0, 8, 1, 3], id).is_ok());
-        assert!(interface.terminate_message(id).is_ok());
+        assert!(interface.send_many(&[0, 0, 1, 3, 2, 5, 12], id).await.is_ok());
+        assert!(interface.send_many(&[0, 8, 1, 3], id).await.is_ok());
+        assert!(interface.terminate_message(id).await.is_ok());
 
-        assert!(interface.send_many(&[1, 4, 3], id).is_err());
+        assert!(interface.send_many(&[1, 4, 3], id).await.is_err());
     }
-    #[test]
-    fn send_to_unreserved_buf_should_fail() {
+    #[tokio::test]
+    async fn send_to_unreserved_buf_should_fail() {
         let interface = Interface::new();
-        assert_eq!(interface.push(), 0);
-        assert_eq!(interface.push(), 1);
+        assert_eq!(interface.push().await, 0);
+        assert_eq!(interface.push().await, 1);
 
-        assert!(interface.send(0, 0).is_ok());
-        assert!(interface.send(0, 1).is_ok());
+        assert!(interface.send(0, 0).await.is_ok());
+        assert!(interface.send(0, 1).await.is_ok());
 
-        assert!(interface.send(0, 2).is_err());
+        assert!(interface.send(0, 2).await.is_err());
     }
-    #[test]
-    fn double_terminate_should_fail() {
+    #[tokio::test]
+    async fn double_terminate_should_fail() {
         let interface = Interface::new();
-        let id = interface.push();
-        interface.send(42, id).unwrap();
-        assert!(interface.terminate_message(id).is_ok());
-        assert!(interface.terminate_message(id).is_err());
+        let id = interface.push().await;
+        interface.send(42, id).await.unwrap();
+        assert!(interface.terminate_message(id).await.is_ok());
+        assert!(interface.terminate_message(id).await.is_err());
     }
-    #[test]
-    fn roi_buf_queue_should_work() {
+    #[tokio::test]
+    async fn roi_buf_queue_should_work() {
         let interface = Interface::new();
         // We should start at 0
-        assert_eq!(interface.push(), 0);
-        interface.send(42, 0).unwrap();
-        interface.terminate_message(0).unwrap();
+        assert_eq!(interface.push().await, 0);
+        interface.send(42, 0).await.unwrap();
+        interface.terminate_message(0).await.unwrap();
         // We haven't fetched, so this should increment
-        assert_eq!(interface.push(), 1);
-        let msg = interface.get_raw(0);
+        assert_eq!(interface.push().await, 1);
+        let msg = interface.get_raw(0).await;
         assert_eq!(msg, [42]);
         // But now we have fetched from the ID, so it should be reused
-        assert_eq!(interface.push(), 0);
+        assert_eq!(interface.push().await, 0);
     }
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "serde")]
-    fn get_should_work() {
+    async fn get_should_work() {
         let interface = Interface::new();
-        let id = interface.push();
-        interface.send(42, id).unwrap();
-        interface.terminate_message(id).unwrap();
+        let id = interface.push().await;
+        interface.send(42, id).await.unwrap();
+        interface.terminate_message(id).await.unwrap();
 
         // This implicitly tests `.get_raw()` as well
-        let msg = interface.get::<u8>(id);
+        let msg = interface.get::<u8>(id).await;
         assert!(msg.is_ok());
         assert_eq!(msg.unwrap(), 42);
     }
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "serde")]
-    fn get_with_wrong_type_should_fail() {
+    async fn get_with_wrong_type_should_fail() {
         let interface = Interface::new();
-        let id = interface.push();
-        interface.send(42, id).unwrap();
-        interface.terminate_message(id).unwrap();
+        let id = interface.push().await;
+        interface.send(42, id).await.unwrap();
+        interface.terminate_message(id).await.unwrap();
 
-        let msg = interface.get::<String>(id);
+        let msg = interface.get::<String>(id).await;
         assert!(msg.is_err());
     }
-    #[test]
-    fn terminate_zero_sized_should_work() {
+    #[tokio::test]
+    async fn terminate_zero_sized_should_work() {
         let interface = Interface::new();
-        let id = interface.push();
-        assert!(interface.terminate_message(id).is_ok());
-        let msg = interface.get_raw(id);
+        let id = interface.push().await;
+        assert!(interface.terminate_message(id).await.is_ok());
+        let msg = interface.get_raw(id).await;
         assert_eq!(msg, []);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn concurrent_get_after_creation_should_resolve() {
+    #[tokio::test]
+    async fn concurrent_get_after_creation_should_resolve() {
         let interface = Box::leak(Box::new(Interface::new()));
 
-        let id = interface.push();
+        let id = interface.push().await;
         // We test this properly elsewhere
         assert_eq!(id, 0, "spurious failure: interface push did not start at 0");
-        let msg = std::thread::spawn(|| {
+        let msg = tokio::task::spawn(async {
             // For lifetime simplicity, we don't bother moving `id` but not `interface`
-            interface.get_raw(0)
+            interface.get_raw(0).await
         });
         assert!(!msg.is_finished());
-        interface.send(42, id).unwrap();
+        interface.send(42, id).await.unwrap();
         // We haven't terminated it yet
         assert!(!msg.is_finished());
-        interface.terminate_message(id).unwrap();
+        interface.terminate_message(id).await.unwrap();
 
-        let msg = msg.join().unwrap();
+        let msg = msg.await.unwrap();
         assert_eq!(msg, [42]);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn concurrent_get_before_creation_should_resolve() {
+    #[tokio::test]
+    async fn concurrent_get_before_creation_should_resolve() {
         let interface = Box::leak(Box::new(Interface::new()));
 
-        let msg = std::thread::spawn(|| {
+        let msg = tokio::task::spawn(async {
             // Note that this message does not even exist yet
-            interface.get_raw(0)
+            interface.get_raw(0).await
         });
         assert!(!msg.is_finished());
         // We test this properly elsewhere
         assert_eq!(
-            interface.push(),
+            interface.push().await,
             0,
             "spurious failure: interface push did not start at 0"
         );
 
         // We can terminate before creation (zero-sized)
-        interface.send(42, 0).unwrap();
+        interface.send(42, 0).await.unwrap();
         // We haven't terminated it yet
         assert!(!msg.is_finished());
-        interface.terminate_message(0).unwrap();
+        interface.terminate_message(0).await.unwrap();
 
-        let msg = msg.join().unwrap();
+        let msg = msg.await.unwrap();
         assert_eq!(msg, [42]);
     }
 }

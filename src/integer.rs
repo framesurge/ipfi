@@ -1,5 +1,10 @@
 use crate::IpfiInteger;
+#[cfg(feature = "blocking")]
 use std::io::Read;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncRead, AsyncReadExt};
+#[cfg(feature = "async")]
+use std::marker::Unpin;
 
 /// Takes in a numerical value and converts it into the smallest Rust integer type it can. For instance,
 /// anything below 255 will be converted into a `u8`.
@@ -108,6 +113,7 @@ impl Integer {
         }
     }
     /// Populates the inner value of this integer by reading from the given reader in little endian byte order.
+    #[cfg(feature = "blocking")]
     pub(crate) fn populate_from_reader(
         self,
         reader: &mut impl Read,
@@ -131,6 +137,36 @@ impl Integer {
             Self::U64(_) => {
                 let mut buf = [0u8; std::mem::size_of::<u64>()];
                 reader.read_exact(&mut buf)?;
+                Ok(Self::U64(u64::from_le_bytes(buf)))
+            }
+        }
+    }
+    /// Populates the inner value of this integer by reading from the given reader in little endian byte order.
+    /// Unlike `.populate_from_reader()`, this uses an asynchronous reader from `tokio`.
+    #[cfg(feature = "async")]
+    pub(crate) async fn populate_from_async_reader(
+        self,
+        reader: &mut (impl AsyncRead + Unpin),
+    ) -> Result<Self, std::io::Error> {
+        match self {
+            Self::U8(_) => {
+                let mut buf = [0u8; std::mem::size_of::<u8>()];
+                reader.read_exact(&mut buf).await?;
+                Ok(Self::U8(u8::from_le_bytes(buf)))
+            }
+            Self::U16(_) => {
+                let mut buf = [0u8; std::mem::size_of::<u16>()];
+                reader.read_exact(&mut buf).await?;
+                Ok(Self::U16(u16::from_le_bytes(buf)))
+            }
+            Self::U32(_) => {
+                let mut buf = [0u8; std::mem::size_of::<u32>()];
+                reader.read_exact(&mut buf).await?;
+                Ok(Self::U32(u32::from_le_bytes(buf)))
+            }
+            Self::U64(_) => {
+                let mut buf = [0u8; std::mem::size_of::<u64>()];
+                reader.read_exact(&mut buf).await?;
                 Ok(Self::U64(u64::from_le_bytes(buf)))
             }
         }

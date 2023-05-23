@@ -21,15 +21,20 @@ dashmap = "5.4.0"
 crossbeam-queue = "0.3"
 nohash-hasher = "0.2"
 fxhash = "0.2"
+tokio = { version = "1", features = [ "sync", "io-util", "rt" ], optional = true }
 
 [dev-dependencies]
 once_cell = "1"
+tokio = { version = "1", features = [ "macros" ] }
 
 [features]
-default = [ "wire", "serde", "int-u16" ]
+default = [ "wire", "serde", "int-u16", "async", "blocking" ]
 
 wire = []
 serde = [ "dep:serde", "rmp-serde", "rmp" ]
+
+async = [ "tokio" ]
+blocking = []
 
 # These are mutually exclusive features that govern which integer type is used internally. When you know approximately
 # how many messages you need to be sending and receiving, this can be extremely useful to reduce memory usage.

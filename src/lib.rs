@@ -1,17 +1,21 @@
-mod complete_lock;
 mod error;
 #[cfg(feature = "wire")]
 mod integer;
-mod interface;
 #[cfg(feature = "serde")]
 mod procedure_args;
 mod roi_queue;
 #[cfg(feature = "wire")]
-mod wire;
+mod wire_utils;
 
-pub use crate::interface::{CallIndex, Interface, ProcedureIndex, WireId};
-#[cfg(feature = "wire")]
-pub use crate::wire::{signal_termination, AutonomousWireHandle, CallHandle, Wire};
+/// A blocking version of IPFI. This supports extreme concurrency, however, and may be preferred in many cases.
+#[cfg(feature = "blocking")]
+pub mod blocking;
+#[cfg(feature = "async")]
+mod r#async;
+
+// We use async by default
+#[cfg(feature = "async")]
+pub use r#async::*;
 
 // --- Internal integer type control ---
 pub use int::*;
@@ -39,3 +43,25 @@ mod int {
 }
 #[cfg(all(feature = "int-u64", target_pointer_width = "32"))]
 compile_error!("attempted to use 64-bit integers on a 32-bit platform, which may lead to panics; do you really need to send over {} messages?", u32::MAX + 1);
+
+// The following are newtype wrappers that can deliberately only be constructed internally to avoid confusion.
+// This also allows us to keep the internals as implementation details, and to change them without a breaking
+// change if necessary.
+/// A call index. This is its own type to avoid confusion.
+///
+/// For information about call indices, see [`Wire`].
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct CallIndex(pub(crate) IpfiInteger);
+/// A procedure index. This is its own type to avoid confusion.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct ProcedureIndex(pub(crate) IpfiInteger);
+// Users need to be able to construct these manually
+impl ProcedureIndex {
+    /// Creates a new procedure index as given.
+    pub fn new(idx: IpfiInteger) -> Self {
+        Self(idx)
+    }
+}
+/// An identifier for a wire.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct WireId(pub(crate) IpfiInteger);

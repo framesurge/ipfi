@@ -1,4 +1,4 @@
-use ipfi::{Interface, ProcedureIndex, Wire};
+use ipfi::blocking::{Interface, ProcedureIndex, Wire};
 use once_cell::sync::Lazy;
 use std::{net::TcpStream, time::Instant};
 

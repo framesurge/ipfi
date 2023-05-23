@@ -1,4 +1,4 @@
-use ipfi::{Interface, ProcedureIndex, Wire};
+use ipfi::blocking::{Interface, ProcedureIndex, Wire};
 use once_cell::sync::Lazy;
 use std::process::{Command, Stdio};
 
@@ -54,7 +54,7 @@ fn main() {
     // taken ownership) or or sending some kind of manual EOF-like signal. This is the latter, and can be used
     // to manually break out of read loops on the client-side. See the method docs for further details.
     if wasm {
-        wire.signal_end_of_input().unwrap();
+        wire.signal_end_of_input();
     }
 
     // Now we can wait on all those handles. If we were communicating with a multi-threaded program, we
@@ -70,7 +70,7 @@ fn main() {
     if !wasm {
         // We could have done this with `ipfi::signal_termination()` if we could get the module's stdin back, but
         // we can't, which is why this method exists
-        wire.signal_termination().unwrap();
+        wire.signal_termination();
     }
 
     // Wait for the module to finish so we don't leave it hanging around
