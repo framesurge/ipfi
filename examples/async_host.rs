@@ -1,10 +1,12 @@
-use ipfi::blocking::{Interface, ProcedureIndex, Wire};
+use ipfi::{Interface, ProcedureIndex, Wire};
 use once_cell::sync::Lazy;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use tokio::process::Command;
 
 static INTERFACE: Lazy<Interface> = Lazy::new(|| Interface::new());
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Get the name of the module executable from arguments (not necessary in most real programs)
     let args = std::env::args().collect::<Vec<_>>();
     let module_path = &args[1];
@@ -40,14 +42,14 @@ fn main() {
     wire.start(module.stdout.take().unwrap(), module.stdin.take().unwrap());
 
     // IPFI is based on procedure calls, so we'll call some from the module now
-    let first_name_handle = wire.call(ProcedureIndex::new(1), ("John",)).unwrap();
+    let first_name_handle = wire.call(ProcedureIndex::new(1), ("John",)).await.unwrap();
     // We wait here to show how Wasm is different to non-Wasm in terms of response grouping, purely for educational
     // purposes
     std::thread::sleep(std::time::Duration::from_secs(1));
-    let last_name_handle = wire.call(ProcedureIndex::new(2), ("Doe",)).unwrap();
+    let last_name_handle = wire.call(ProcedureIndex::new(2), ("Doe",)).await.unwrap();
 
     // This procedure takes no arguments at all
-    let magic_number_handle = wire.call(ProcedureIndex::new(0), ()).unwrap();
+    let magic_number_handle = wire.call(ProcedureIndex::new(0), ()).await.unwrap();
 
     // If we're deaing with a single-threaded remote program that reads all its input at once, we have to tell it
     // when we're done, which would require either dropping `module.stdin` here (impossible because the wire has
@@ -59,9 +61,9 @@ fn main() {
 
     // Now we can wait on all those handles. If we were communicating with a multi-threaded program, we
     // could wait on them as we make the calls (i.e. `.call(..).unwrap().wait::<()>().unwrap()`).
-    let _: () = first_name_handle.wait().unwrap();
-    let _: () = last_name_handle.wait().unwrap();
-    let magic_number: u32 = magic_number_handle.wait().unwrap();
+    let _: () = first_name_handle.wait().await.unwrap();
+    let _: () = last_name_handle.wait().await.unwrap();
+    let magic_number: u32 = magic_number_handle.wait().await.unwrap();
 
     println!("Magic number was {}!", magic_number);
 
@@ -74,5 +76,5 @@ fn main() {
     }
 
     // Wait for the module to finish so we don't leave it hanging around
-    let _ = module.wait();
+    let _ = module.wait().await;
 }
