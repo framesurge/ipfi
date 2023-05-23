@@ -1,9 +1,9 @@
+use super::complete_lock::CompleteLock;
+use crate::error::Error;
 #[cfg(feature = "serde")]
 use crate::procedure_args::Tuple;
-use crate::{IpfiInteger, ProcedureIndex, CallIndex, WireId};
-use crate::error::Error;
 use crate::roi_queue::RoiQueue;
-use super::complete_lock::CompleteLock;
+use crate::{CallIndex, IpfiInteger, ProcedureIndex, WireId};
 use dashmap::DashMap;
 use fxhash::FxBuildHasher;
 use nohash_hasher::BuildNoHashHasher;
@@ -396,20 +396,36 @@ mod tests {
     #[tokio::test]
     async fn call_buffers_should_be_distinct() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0)).await;
-        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1)).await;
-        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(1), WireId(0)).await;
-        let buf_4 = interface.get_call_buffer(ProcedureIndex(1), CallIndex(0), WireId(0)).await;
+        let buf_1 = interface
+            .get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
+            .await;
+        let buf_2 = interface
+            .get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
+            .await;
+        let buf_3 = interface
+            .get_call_buffer(ProcedureIndex(0), CallIndex(1), WireId(0))
+            .await;
+        let buf_4 = interface
+            .get_call_buffer(ProcedureIndex(1), CallIndex(0), WireId(0))
+            .await;
 
         assert!(!has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
     }
     #[tokio::test]
     async fn call_buffers_should_be_reused() {
         let interface = Box::leak(Box::new(Interface::new()));
-        let buf_1 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0)).await;
-        let buf_2 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1)).await;
-        let buf_3 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0)).await;
-        let buf_4 = interface.get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1)).await;
+        let buf_1 = interface
+            .get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
+            .await;
+        let buf_2 = interface
+            .get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
+            .await;
+        let buf_3 = interface
+            .get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(0))
+            .await;
+        let buf_4 = interface
+            .get_call_buffer(ProcedureIndex(0), CallIndex(0), WireId(1))
+            .await;
 
         assert!(has_duplicates(&[buf_1, buf_2, buf_3, buf_4]));
         assert!(buf_1 == buf_3 && buf_2 == buf_4);
@@ -447,7 +463,10 @@ mod tests {
         let interface = Interface::new();
         let id = interface.push().await;
 
-        assert!(interface.send_many(&[0, 0, 1, 3, 2, 5, 12], id).await.is_ok());
+        assert!(interface
+            .send_many(&[0, 0, 1, 3, 2, 5, 12], id)
+            .await
+            .is_ok());
         assert!(interface.send_many(&[0, 8, 1, 3], id).await.is_ok());
         assert!(interface.terminate_message(id).await.is_ok());
 

@@ -1,9 +1,9 @@
+use super::complete_lock::CompleteLock;
+use crate::error::Error;
 #[cfg(feature = "serde")]
 use crate::procedure_args::Tuple;
-use crate::{IpfiInteger, ProcedureIndex, CallIndex, WireId};
-use crate::error::Error;
 use crate::roi_queue::RoiQueue;
-use super::complete_lock::CompleteLock;
+use crate::{CallIndex, IpfiInteger, ProcedureIndex, WireId};
 use dashmap::DashMap;
 use fxhash::FxBuildHasher;
 use nohash_hasher::BuildNoHashHasher;

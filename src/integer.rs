@@ -2,9 +2,9 @@ use crate::IpfiInteger;
 #[cfg(feature = "blocking")]
 use std::io::Read;
 #[cfg(feature = "async")]
-use tokio::io::{AsyncRead, AsyncReadExt};
-#[cfg(feature = "async")]
 use std::marker::Unpin;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Takes in a numerical value and converts it into the smallest Rust integer type it can. For instance,
 /// anything below 255 will be converted into a `u8`.

@@ -7,11 +7,11 @@ mod roi_queue;
 #[cfg(feature = "wire")]
 mod wire_utils;
 
+#[cfg(feature = "async")]
+mod r#async;
 /// A blocking version of IPFI. This supports extreme concurrency, however, and may be preferred in many cases.
 #[cfg(feature = "blocking")]
 pub mod blocking;
-#[cfg(feature = "async")]
-mod r#async;
 
 // We use async by default
 #[cfg(feature = "async")]

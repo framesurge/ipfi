@@ -1,5 +1,5 @@
-use tokio::sync::{Mutex, Notify};
 use std::sync::Arc;
+use tokio::sync::{Mutex, Notify};
 
 /// A completion lock based on `Condvar`s, which are the most efficient mechanism for
 /// this kind of lock on platforms that support them.
@@ -27,7 +27,9 @@ impl CompleteLock {
         let (lock, notifier) = &*self.pair;
         // Perform an outright check first
         let completed = lock.lock().await;
-        if *completed { return }
+        if *completed {
+            return;
+        }
         drop(completed);
 
         loop {
@@ -35,7 +37,9 @@ impl CompleteLock {
             notifier.notified().await;
             // And check the guard, otherwise waiting again
             let completed = lock.lock().await;
-            if *completed { break }
+            if *completed {
+                break;
+            }
         }
     }
 }

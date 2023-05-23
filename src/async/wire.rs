@@ -1,26 +1,20 @@
+use super::interface::Interface;
 use crate::integer::*;
 #[cfg(feature = "serde")]
 use crate::procedure_args::ProcedureArgs;
-use crate::{
-    error::Error,
-    IpfiInteger,
-    CallIndex, ProcedureIndex, WireId,
-};
-use super::interface::Interface;
+use crate::wire_utils::*;
+use crate::{error::Error, CallIndex, IpfiInteger, ProcedureIndex, WireId};
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use fxhash::FxBuildHasher;
 use nohash_hasher::BuildNoHashHasher;
 #[cfg(feature = "serde")]
 use serde::de::DeserializeOwned;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
-use crate::wire_utils::*;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
@@ -112,9 +106,8 @@ impl Wire<'static> {
         mut writer: impl AsyncWrite + Unpin + Send + Sync + 'static,
     ) -> AutonomousWireHandle {
         let self_reader = self.clone();
-        let reader = tokio::task::spawn(async move {
-            while self_reader.fill(&mut reader).await.is_ok() {}
-        });
+        let reader =
+            tokio::task::spawn(async move { while self_reader.fill(&mut reader).await.is_ok() {} });
         let self_writer = self.clone();
         let writer = tokio::task::spawn(async move {
             // TODO Spinning...
@@ -223,7 +216,8 @@ impl<'a> Wire<'a> {
         }
 
         let args = args.into_bytes()?;
-        self.start_call_with_partial_bytes(procedure_idx, &args).await
+        self.start_call_with_partial_bytes(procedure_idx, &args)
+            .await
     }
     /// Same as `.start_call_with_partial_args()`, but this works directly with bytes, allowing you to send strange things
     /// like a two-thirds of an argument.
@@ -442,7 +436,10 @@ impl<'a> Wire<'a> {
     ///
     /// This returns whether or not it read a message/call termination message). Alternately, `None` will be returned
     /// if there was a manual end of input message, or on a wire termination.
-    pub async fn receive_one(&self, reader: &mut (impl AsyncRead + Unpin)) -> Result<Option<bool>, Error> {
+    pub async fn receive_one(
+        &self,
+        reader: &mut (impl AsyncRead + Unpin),
+    ) -> Result<Option<bool>, Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -493,10 +490,10 @@ impl<'a> Wire<'a> {
                     // Call
                     1 => {
                         // We need to know where to put argument information
-                        let call_buf_idx =
-                            self.interface
-                                .get_call_buffer(procedure_idx, call_idx, self.id)
-                                .await;
+                        let call_buf_idx = self
+                            .interface
+                            .get_call_buffer(procedure_idx, call_idx, self.id)
+                            .await;
                         // And now put it there, accumulating across many messages as necessary
                         self.interface.send_many(&bytes, call_buf_idx).await?;
 
@@ -507,10 +504,10 @@ impl<'a> Wire<'a> {
 
                             // This will actually execute!
                             // Note that this will remove the `call_buf_idx` mapping and drain the arguments out of that buffer
-                            let ret =
-                                self.interface
-                                    .call_procedure(procedure_idx, call_idx, self.id)
-                                    .await?;
+                            let ret = self
+                                .interface
+                                .call_procedure(procedure_idx, call_idx, self.id)
+                                .await?;
                             let ret_msg = Message::Response {
                                 procedure_idx,
                                 call_idx,
@@ -607,7 +604,10 @@ impl<'a> Wire<'a> {
     /// single method: if the wire has terminated, they willall immediately fail! Call this only when communicating with an
     /// unknown or untrusted program, but keeping in mind that they could easily ignore the termination signal (i.e. this cannot
     /// be used as a superficial measure).
-    pub async fn flush_terminate(&self, writer: &mut (impl AsyncWrite + Unpin)) -> Result<(), Error> {
+    pub async fn flush_terminate(
+        &self,
+        writer: &mut (impl AsyncWrite + Unpin),
+    ) -> Result<(), Error> {
         if self.is_terminated() {
             return Err(Error::WireTerminated);
         }
@@ -736,7 +736,9 @@ impl AutonomousWireHandle {
 /// program will detect, implicitly causing a termination and preventing further writes.
 ///
 /// For more information on wire terminations, see [`Wire`].
-pub async fn signal_termination(writer: &mut (impl AsyncWrite + Unpin)) -> Result<(), std::io::Error> {
+pub async fn signal_termination(
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), std::io::Error> {
     let msg = Message::Termination;
     let bytes = msg.to_bytes();
     writer.write_all(&bytes).await?;
@@ -781,7 +783,10 @@ mod tests {
             bytes
         });
 
-        let handle = bob.wire.call_with_bytes(ProcedureIndex(0), &[0, 1, 2, 3]).await;
+        let handle = bob
+            .wire
+            .call_with_bytes(ProcedureIndex(0), &[0, 1, 2, 3])
+            .await;
         assert!(handle.is_ok());
 
         // Bob signals that he's done and sends everything he has to Alice

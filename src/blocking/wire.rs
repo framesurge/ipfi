@@ -1,12 +1,9 @@
+use super::interface::Interface;
 use crate::integer::*;
 #[cfg(feature = "serde")]
 use crate::procedure_args::ProcedureArgs;
-use crate::{
-    error::Error,
-    IpfiInteger,
-    CallIndex, ProcedureIndex, WireId,
-};
-use super::interface::Interface;
+use crate::wire_utils::*;
+use crate::{error::Error, CallIndex, IpfiInteger, ProcedureIndex, WireId};
 use crossbeam_queue::SegQueue;
 use dashmap::DashMap;
 use fxhash::FxBuildHasher;
@@ -21,7 +18,6 @@ use std::{
     },
     thread::JoinHandle,
 };
-use crate::wire_utils::*;
 
 /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
 ///

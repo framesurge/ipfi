@@ -1,4 +1,7 @@
-use crate::{integer::{Integer, get_as_smallest_int, get_as_smallest_int_from_usize}, ProcedureIndex, CallIndex};
+use crate::{
+    integer::{get_as_smallest_int, get_as_smallest_int_from_usize, Integer},
+    CallIndex, ProcedureIndex,
+};
 
 /// Creates a one-byte multiflag containing metadata about a message.
 pub(crate) fn make_multiflag(
