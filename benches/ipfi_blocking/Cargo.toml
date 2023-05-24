@@ -1,14 +1,14 @@
 [package]
-name = "ipfi-bench-ipfi"
+name = "ipfi-bench-ipfi-blocking"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "ipfi-bench-server"
+name = "ipfi-blocking-bench-server"
 path = "src/server.rs"
 
 [[bin]]
-name = "ipfi-bench-client"
+name = "ipfi-blocking-bench-client"
 path = "src/client.rs"
 
 [dependencies]
