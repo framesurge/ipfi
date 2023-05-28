@@ -76,14 +76,9 @@ fn bench_x_against_y(
     Ok(lines.join("\n"))
 }
 
-/// Calculates, as a percentage, how much faster `new` is than `old`. If this is negative, `old` was faster by the given amount
+/// Calculates, as a percentage, how much faster `new` is than `old`. If this is negative, `old` was faster by the given amount.
 fn calc_percent_differential(old: f64, new: f64) -> f64 {
-    let assuming_new = (old / new - 1.0) * 100.0;
-    if assuming_new > 0.0 {
-        assuming_new
-    } else {
-        -(new / old - 1.0) * 100.0
-    }
+    ((old - new) / old) * 100.0
 }
 
 fn bench_avg(name: &str, times: usize) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
