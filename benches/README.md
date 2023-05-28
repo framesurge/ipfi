@@ -24,3 +24,5 @@ Metric 'call_time': ipfi_async (149.2μs) is 50.8% faster than grpc (303.6μs).
 Metric 'connect_time': ipfi_async (47.7μs) is 66.5% faster than grpc (142.2μs).
 Metric 'total_time': ipfi_async (197.3μs) is 55.8% faster than grpc (446.3μs).
 ```
+
+In this benchmark, **IPFI is 2.3x faster than gRPC** (with IPFI's synchronous API).
