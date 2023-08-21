@@ -1,9 +1,11 @@
 mod error;
 #[cfg(feature = "wire")]
 mod integer;
+mod interface_common;
 #[cfg(feature = "serde")]
 mod procedure_args;
 mod roi_queue;
+mod wire_common;
 #[cfg(feature = "wire")]
 mod wire_utils;
 
