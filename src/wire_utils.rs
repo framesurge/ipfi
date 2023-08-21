@@ -1,18 +1,42 @@
 use crate::{
+    error::*,
     integer::{get_as_smallest_int, get_as_smallest_int_from_usize, Integer},
-    CallIndex, ProcedureIndex,
+    CallIndex, ProcedureIndex, Terminator,
 };
+
+impl Terminator {
+    fn to_flag(self) -> (bool, bool) {
+        match self {
+            Terminator::Complete => (true, true),
+            Terminator::Chunk => (true, false),
+            Terminator::None => (false, false),
+            // NOTE: There is one unexhausted possibility here in the multiflag (i.e. `(false, true)`)
+        }
+    }
+    pub(crate) fn from_flag(flag: (bool, bool)) -> Result<Self, Error> {
+        match flag {
+            (true, true) => Ok(Self::Complete),
+            (true, false) => Ok(Self::Chunk),
+            (false, false) => Ok(Self::None),
+            // This is not a valid message
+            (false, true) => Err(Error::InvalidTerminator),
+        }
+    }
+}
 
 /// Creates a one-byte multiflag containing metadata about a message.
 pub(crate) fn make_multiflag(
+    // These integers all specify the type of integer that will be used for these
+    // values
     procedure_idx: &Integer,
     call_idx: &Integer,
     num_bytes: &Integer,
-    is_terminator: bool,
+    terminator: Terminator,
 ) -> u8 {
     let flag_1 = procedure_idx.to_flag();
     let flag_2 = call_idx.to_flag();
     let flag_3 = num_bytes.to_flag();
+    let terminator_flag = terminator.to_flag();
 
     let bool_arr = [
         flag_1.0,
@@ -21,8 +45,8 @@ pub(crate) fn make_multiflag(
         flag_2.1,
         flag_3.0,
         flag_3.1,
-        is_terminator,
-        false,
+        terminator_flag.0,
+        terminator_flag.1,
     ];
     bool_array_to_u8(&bool_arr)
 }
@@ -57,21 +81,22 @@ pub(crate) enum Message<'b> {
     Call {
         procedure_idx: ProcedureIndex, // Remote
         call_idx: CallIndex,           // Remote
-        terminator: bool,
+        terminator: Terminator,
 
         args: &'b [u8],
     },
-    /// A response to a `Call` message that contains the return type. This is not necessarily self-contained, and
-    /// requires an explicit termination signal, as procedures may stream data in the future.
+    /// A response to a `Call` message that contains the return type. This is where chunk termination signals
+    /// are especially important with streaming procedures.
     Response {
         // These properties are the same as we used in the `Call`, meaning the caller has no influence over our message
         // buffers whatsoever, allowing the `Wire` to act as a security layer over the `Interface`
         procedure_idx: ProcedureIndex,
         call_idx: CallIndex,
-        terminator: bool,
+        terminator: Terminator,
 
         message: &'b [u8],
     },
+    // TODO Error message for failing procedure calls or the like (to avoid poisoning the whole wire)
     /// A message that indicates that the sender will not send any more data. This is different from termination
     /// in that it implies that the channel is still open for the sender to receive more data, this merely means
     /// that the sender will not send anything further. This message is irrevocable, and generally useless, except

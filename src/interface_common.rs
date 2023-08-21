@@ -1,6 +1,40 @@
 //! This internal module contains code that is common between the blocking and asynchronous `Interface` types.
 
 use crate::error::Error;
+use crate::Terminator;
+
+/// A procedure registered on an interface.
+pub(crate) enum Procedure {
+    /// A procedure that resolves immediately, returning all its output at once.
+    Standard {
+        /// The closure that will be called, which uses pure bytes as an interface. If there is a failure to
+        /// deserialize the arguments or serialize the return type, an error will be returned.
+        ///
+        /// The bytes this takes for its arguments will *not* have a MessagePack length marker set at the front,
+        /// and that will be added internally at deserialization.
+        #[allow(clippy::type_complexity)]
+        closure: Box<dyn Fn(&[u8]) -> Result<Vec<u8>, Error> + Send + Sync + 'static>,
+    },
+    /// A procedure that streams its output gradually.
+    ///
+    /// Note that this is used to also support asynchronous procedures that still return all their output
+    /// at once, just after a delay.
+    Streaming {
+        /// The closure that will be called. This is expected to return immediately, and then handle the process
+        /// of streaming values later as it wishes: it will be provided a closure that can be used to yield individual
+        /// values. Note that the closure will almost certainly have to spawn a new thread or task to run itself.
+        #[allow(clippy::type_complexity)]
+        closure: Box<
+            dyn Fn(
+                    Box<dyn Fn(Vec<u8>, Terminator) + Send + Sync + 'static>,
+                    &[u8],
+                ) -> Result<(), Error>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    },
+}
 
 /// Defines the entire interface. The only difference between the blocking and async interfaces is that one uses
 /// `async`/`await` because of the different `CompleteLock`, so we just set that up very simply!
@@ -13,7 +47,7 @@ macro_rules! define_interface {
         #[cfg(feature = "serde")]
         use $crate::procedure_args::Tuple;
         use $crate::roi_queue::RoiQueue;
-        use $crate::{CallIndex, IpfiInteger, ProcedureIndex, WireId};
+        use $crate::{CallIndex, Terminator, IpfiInteger, ProcedureIndex, WireId};
         use dashmap::DashMap;
         use fxhash::FxBuildHasher;
         use nohash_hasher::BuildNoHashHasher;
@@ -23,7 +57,7 @@ macro_rules! define_interface {
 
         /// An inter-process communication (IPC) interface based on the arbitrary reception of bytes.
         ///
-        /// This is formed in a message-based interface, with messages identified by 32-bit integers. Each time
+        /// This is formed in a message-based interface, with messages identified by variable-size integers. Each time
         /// a new value is sent into the interface, it will be added to the provided message, allowing data from
         /// multiple sources to be simultaneously accumulated. Once `-1` is sent, the message will be marked as
         /// completed, and future attempts to write to it will fail. Thread-safety and mutability locks are
@@ -36,8 +70,9 @@ macro_rules! define_interface {
         pub struct Interface {
             /// The messages received over the interface. This is implemented as a concurrent hash map indexed by a `IpfiInteger`,
             /// which means that, when a message is read, we can remove its entry from the map entirely and its identifier can
-            /// be relinquished into a reuse-or-increment queue.
-            messages: DashMap<IpfiInteger, (Vec<u8>, CompleteLock), BuildNoHashHasher<IpfiInteger>>,
+            /// be relinquished into a reuse-or-increment queue. The second entry in the value tuple is a chunk count, used for
+            /// allowing length-aware deserialisation of streamed lists of discrete packets.
+            messages: DashMap<IpfiInteger, (Vec<u8>, IpfiInteger, CompleteLock), BuildNoHashHasher<IpfiInteger>>,
             /// A queue that produces unique message identifiers while allowing us to recycle old ones. This enables far greater
             /// memory efficiency.
             message_id_queue: RoiQueue,
@@ -57,7 +92,7 @@ macro_rules! define_interface {
             /// For clarity, this is a map of `(procedure_idx, call_idx, wire_id)` to `buf_idx`.
             call_to_buffer_map: DashMap<(ProcedureIndex, CallIndex, WireId), IpfiInteger, FxBuildHasher>,
             /// A queue that produces unique identifiers for the next wire that connects to this interface. Wire identifiers
-            /// are needed to ensure that call indices, which h may be the same across multiple wires, are kept separate from
+            /// are needed to ensure that call indices, which may be the same across multiple wires, are kept separate from
             /// each other. This queue will automatically recirculate relinquished identifiers.
             wire_id_queue: RoiQueue,
         }
@@ -111,7 +146,7 @@ macro_rules! define_interface {
             #[cfg(feature = "serde")]
             pub fn add_procedure<
                 A: Serialize + DeserializeOwned + Tuple,
-            R: Serialize + DeserializeOwned,
+                R: Serialize + DeserializeOwned,
             >(
                 &self,
                 idx: IpfiInteger,
@@ -137,7 +172,48 @@ macro_rules! define_interface {
 
                     Ok(ret)
                 });
-                let procedure = Procedure { closure };
+                let procedure = Procedure::Standard { closure };
+                self.procedures.insert(ProcedureIndex(idx), procedure);
+            }
+            /// Adds a streaming procedure with serialisation handled automatically. This is designed for procedures that will yield
+            /// something that can eventually be interpreted as a list of values, and, as such, each yield will be interpreted as
+            /// a separate *chunk*. On the other side, the caller will be able to deserialise the response as a list of values. Hence,
+            /// the yielder passed to such procedures only requires the caller to specify whether or not the yielded message is the final
+            /// chunk. If you wish to send partial chunks, this should be done manually through `.add_raw_streaming_procedure()`.
+            #[cfg(feature = "serde")]
+            pub fn add_sequence_procedure<
+                A: Serialize + DeserializeOwned + Tuple,
+                R: Serialize + DeserializeOwned,
+            >(
+                &self,
+                idx: IpfiInteger,
+                f: impl Fn(Box<dyn Fn(R, bool) + Send + Sync + 'static>, A) + Send + Sync + 'static,
+            ) {
+                let closure = Box::new(move |raw_yielder: Box<dyn Fn(Vec<u8>, Terminator) + Send + Sync + 'static>, data: &[u8]| {
+                    // Add the correct length prefix so this can be deserialized as the tuple it is (this is what allows
+                    // piecemeal argument transmission)
+                    let arg_tuple = if A::len() == 0 {
+                        // If the function takes no arguments, the length marker hack doesn't work
+                        rmp_serde::decode::from_slice(&rmp_serde::encode::to_vec(&())?)?
+                    } else {
+                        let mut bytes = Vec::new();
+                        rmp::encode::write_array_len(&mut bytes, A::len())
+                            .map_err(|_| Error::WriteLenMarkerFailed)?;
+                        bytes.extend(data);
+
+                        rmp_serde::decode::from_slice(&bytes)?
+                    };
+                    let yielder = Box::new(move |data: R, is_final: bool| {
+                        let data = rmp_serde::encode::to_vec(&data).expect("TODO: error message system for failures like this");
+                        let terminator = if is_final { Terminator::Complete } else { Terminator::Chunk };
+                        raw_yielder(data, terminator);
+                    });
+
+                    f(yielder, arg_tuple);
+
+                    Ok(())
+                });
+                let procedure = Procedure::Streaming { closure };
                 self.procedures.insert(ProcedureIndex(idx), procedure);
             }
             /// Same as `.add_procedure()`, but this accepts procedures that work directly with raw bytes, involving no serialization or deserialization
@@ -150,14 +226,55 @@ macro_rules! define_interface {
                 f: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static,
             ) {
                 // We only need to wrap the result in `Ok(..)`
-                let procedure = Procedure {
+                let procedure = Procedure::Standard {
                     closure: Box::new(move |data: &[u8]| Ok(f(data))),
+                };
+                self.procedures.insert(ProcedureIndex(idx), procedure);
+            }
+            /// Same as `.add_procedure_raw()`, but this will add a *streaming* procedure, which, rather than returning its output all in
+            /// one go, will yield chunks of it gradually, allowing it to continue operating in the background while other messages
+            /// are processed. This can be used both for procedures that gather parts of their output gradually (e.g. those that yield
+            /// real-time information) and for asynchronous procedures, which will return all their output at once, but after they
+            /// have finished a computation in parallel.
+            ///
+            /// Note that streaming procedures should provide *all* their output through the given closure (which can be thought
+            /// of as analogous to the `yield` keyword in languages with native support for generators). The second argument
+            /// to this closure is whether or not your procedure is finished. After you have called `yielder(_, true)`, any
+            /// subsequent calls will be propagated, but disregarded by a compliant IPFI implementation on the other side of the
+            /// wire.
+            ///
+            /// You should be especially careful of the value of [`Terminator`] you set for each yield. Of course, the final yield
+            /// should be [`Terminator::Complete`], however streaming procedures have the notion of *chunks*, which are discrete
+            /// packets for later deserialisation. For instance, you could use a streaming procedure to stream parts of a single
+            /// string, or you could stream independent strings. These have different serialised representations, and, as such, it
+            /// is typical to want to maintain a count of how many chunks have been sent. By setting [`Terminator::Chunk`], you
+            /// can explicitly mark such chunks. Note that this also means you can send partial chunks.
+            ///
+            /// **Warning:** this function is deliberately low-level, and performs *absolutely no thread management*. Your procedure
+            /// should return as soon as possible, and should start a thread/task that then performs subsequent yields. If you'd like
+            /// your procedure to automatically be executed in another thread/task, or if you'd like to return an actual `Stream`,
+            /// then you may want to use another, higher-level method on [`Interface`]. Additionally, bear in mind that working with
+            /// serialisation is somewhat harder when working with streams, as all data will be collated into the same buffer for
+            /// deserialisation when received. This means procedures that are not accumulating some larger object, but rather a sequence
+            /// of smaller objects, will need to yield a MessagePack array prefix as their first item. This is handled automatically
+            /// by the higher-level method `.add_sequence_procedure()`.
+            pub fn add_raw_streaming_procedure(
+                &self,
+                idx: IpfiInteger,
+                f: impl Fn(Box<dyn Fn(Vec<u8>, Terminator) + Send + Sync + 'static>, &[u8]) + Send + Sync + 'static,
+            ) {
+                let procedure = Procedure::Streaming {
+                    closure: Box::new(move |yielder, data: &[u8]| {
+                        f(yielder, data);
+
+                        Ok(())
+                    }),
                 };
                 self.procedures.insert(ProcedureIndex(idx), procedure);
             }
             /// Deletes the given message buffer and relinquishes its unique identifier back into
             /// the queue for reuse. This must be provided an ID that was previously issued by `.push()`.
-            fn pop(&self, id: IpfiInteger) -> Option<(Vec<u8>, CompleteLock)> {
+            fn pop(&self, id: IpfiInteger) -> Option<(Vec<u8>, IpfiInteger, CompleteLock)> {
                 if let Some((_id, val)) = self.messages.remove(&id) {
                     self.message_id_queue.relinquish(id);
                     Some(val)
@@ -169,6 +286,9 @@ macro_rules! define_interface {
             /// argument information from the given internal message buffer index, which it expects to be completed. This method
             /// will not block waiting for a completion (or creation) of that buffer.
             ///
+            /// If this calls a streaming procedure, this will return `Ok(None)` on a success, as the return value will be sent
+            /// through the given yielder function.
+            ///
             /// There is no method provided to avoid byte serialization, because procedure calls over IPFI are intended to be made solely by
             /// remote communicators.
             pub $($async)? fn call_procedure(
@@ -176,7 +296,8 @@ macro_rules! define_interface {
                 procedure_idx: ProcedureIndex,
                 call_idx: CallIndex,
                 wire_id: WireId,
-            ) -> Result<Vec<u8>, Error> {
+                yielder: impl Fn(Vec<u8>, Terminator) + Send + Sync + 'static,
+            ) -> Result<Option<Vec<u8>>, Error> {
                 // Get the buffer where the arguments are supposed to be, and then delete that mapping to free up some space
                 let args_buf_idx = self.get_call_buffer(procedure_idx, call_idx, wire_id)$(.$await)?;
                 self.call_to_buffer_map
@@ -184,10 +305,16 @@ macro_rules! define_interface {
 
                 if let Some(procedure) = self.procedures.get(&procedure_idx) {
                     if let Some(m) = self.messages.get(&args_buf_idx) {
-                        let (args, complete_lock) = m.value();
+                        let (args, _chunk_count, complete_lock) = m.value();
                         if complete_lock.completed()$(.$await)? {
                             // The length marker will be inserted by the internal wrapper closure
-                            let ret = (procedure.closure)(args);
+                            let ret = match &*procedure {
+                                Procedure::Standard { closure } => (closure)(args).map(|val| Some(val)),
+                                Procedure::Streaming { closure } => {
+                                    (closure)(Box::new(yielder), args)?;
+                                    Ok(None)
+                                }
+                            };
                             // Success, relinquish this message buffer
                             // To do that though, we have to drop anything referencing the map
                             drop(m);
@@ -238,7 +365,7 @@ macro_rules! define_interface {
             pub $($async)? fn push(&self) -> IpfiInteger {
                 let new_id = self.message_id_queue.get();
                 self.messages
-                    .insert(new_id, (Vec::new(), CompleteLock::new()));
+                    .insert(new_id, (Vec::new(), 0, CompleteLock::new()));
 
                 // If anyone was waiting for this buffer to exist, it now does!
                 if let Some(lock) = self.creation_locks.get_mut(&new_id) {
@@ -262,7 +389,7 @@ macro_rules! define_interface {
             /// careful in how it handles these errors.
             pub $($async)? fn send(&self, datum: i8, message_id: IpfiInteger) -> Result<bool, Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
-                    let (message, complete_lock) = m.value_mut();
+                    let (message, _chunk_count, complete_lock) = m.value_mut();
                     if complete_lock.completed()$(.$await)? {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else if datum < 0 {
@@ -281,7 +408,7 @@ macro_rules! define_interface {
             /// be handled separately.
             pub $($async)? fn send_many(&self, data: &[u8], message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
-                    let (message, complete_lock) = m.value_mut();
+                    let (message, _chunk_count, complete_lock) = m.value_mut();
                     if complete_lock.completed()$(.$await)? {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
@@ -293,14 +420,32 @@ macro_rules! define_interface {
                 }
             }
             /// Explicitly terminates the message with the given index. This will return an error if the message
-            /// has already been terminated or if it was out-of-bounds.
+            /// has already been terminated or if it was out-of-bounds. This will *not* increment the number of chunks,
+            /// which should be done separately (before calling this function!) if streaming deserialisation might be
+            /// used. If not, the chunk count can be left alone.
             pub $($async)? fn terminate_message(&self, message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
-                    let (_message, complete_lock) = m.value_mut();
+                    let (_message, _chunk_count, complete_lock) = m.value_mut();
                     if complete_lock.completed()$(.$await)? {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
                         complete_lock.mark_complete()$(.$await)?;
+                        Ok(())
+                    }
+                } else {
+                    Err(Error::OutOfBounds { index: message_id })
+                }
+            }
+            /// Increment the number of chunks associated with the given message buffer. This will fail if the message
+            /// has already been terminated (meaning you must update the chunk count before terminating a message,
+            /// if you care about chunk counts).
+            pub $($async)? fn increment_chunk_count(&self, message_id: IpfiInteger) -> Result<(), Error> {
+                if let Some(mut m) = self.messages.get_mut(&message_id) {
+                    let (_message, chunk_count, complete_lock) = m.value_mut();
+                    if complete_lock.completed()$(.$await)? {
+                        Err(Error::AlreadyCompleted { index: message_id })
+                    } else {
+                        *chunk_count += 1;
                         Ok(())
                     }
                 } else {
@@ -320,6 +465,24 @@ macro_rules! define_interface {
                 let decoded = rmp_serde::decode::from_slice(&message)?;
                 Ok(decoded)
             }
+            /// Same as `.get()`, except this is designed to be used for procedures that are known to stream their output
+            /// in discrete chunks. There are two broad types of streaming procedures: those that stream bytes gradually that
+            /// eventually become part of a greater whole (all deserialised at once), and those that stream discrete objects that
+            /// should all be deserialised independently. This function is for the latter type.
+            ///
+            /// Note that, if used on any other type of message, this will still work, it will just produce a vector of length 1
+            /// (as there was only one chunk involved).
+            #[cfg(feature = "serde")]
+            pub $($async)? fn get_chunks<T: DeserializeOwned>(&self, message: IpfiInteger) -> Result<Vec<T>, Error> {
+                let (message, chunk_count) = self.get_raw_with_chunk_count(message)$(.$await)?;
+                let mut bytes = Vec::new();
+                // XXX: It is theoretically possible for this to fail if we pass `u32::MAX` chunks, somehow...
+                rmp::encode::write_array_len(&mut bytes, chunk_count.into())
+                            .map_err(|_| Error::WriteLenMarkerFailed)?;
+                bytes.extend(message);
+                let decoded = rmp_serde::decode::from_slice(&bytes)?;
+                Ok(decoded)
+            }
             /// Same as `.get()`, but gets the raw byte array instead. Note that this will copy the underlying bytes to return
             /// them outside the thread-lock.
             ///
@@ -329,6 +492,12 @@ macro_rules! define_interface {
             /// available for future messages or procedure call metadata. This means that requesting the same message
             /// index may yield completely different data.
             pub $($async)? fn get_raw(&self, message_id: IpfiInteger) -> Vec<u8> {
+                let (message, _chunk_count) = self.get_raw_with_chunk_count(message_id)$(.$await)?;
+                message
+            }
+            /// Same as `.get_raw()`, but this also includes the number of defined chunks this message came in. Note
+            /// that the number of chunks is administered through a separate definition process to the end of a message.
+            pub $($async)? fn get_raw_with_chunk_count(&self, message_id: IpfiInteger) -> (Vec<u8>, IpfiInteger) {
                 // We need two completion locks to be ready before we're ready: the first is
                 // a creation lock on the message index, and the second is a lock on its
                 // actual completion. We'll start by creating a new completion lock if one
@@ -359,7 +528,7 @@ macro_rules! define_interface {
                             .expect("complete lock should signal that message exists")
                     };
                     // Cheap clone
-                    message.1.clone()
+                    message.2.clone()
                 };
 
                 message_lock.wait_for_completion()$(.$await)?;
@@ -368,8 +537,8 @@ macro_rules! define_interface {
                 // Note that this will also prepare the message identifier for reuse.
                 // This is safe to call because we only hold a clone of the completion
                 // lock.
-                let (message, _complete_lock) = self.pop(message_id).unwrap();
-                message
+                let (message, chunk_count, _complete_lock) = self.pop(message_id).unwrap();
+                (message, chunk_count)
             }
         }
     };
@@ -508,15 +677,4 @@ macro_rules! define_interface_tests {
             assert_eq!(msg, []);
         }
     };
-}
-
-/// A procedure registered on an interface.
-pub(crate) struct Procedure {
-    /// The closure that will be called, which uses pure bytes as an interface. If there is a failure to
-    /// deserialize the arguments or serialize the return type, an error will be returned.
-    ///
-    /// The bytes this takes for its arguments will *not* have a MessagePack length marker set at the front,
-    /// and that will be added internally at deserialization.
-    #[allow(clippy::type_complexity)]
-    pub(crate) closure: Box<dyn Fn(&[u8]) -> Result<Vec<u8>, Error> + Send + Sync + 'static>,
 }

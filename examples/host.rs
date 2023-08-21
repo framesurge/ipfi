@@ -49,6 +49,9 @@ fn main() {
     // This procedure takes no arguments at all
     let magic_number_handle = wire.call(ProcedureIndex::new(0), ()).unwrap();
 
+    // This procedure will stream some output to us in chunks (which is extremely efficient)
+    let stream_handle = wire.call(ProcedureIndex::new(3), ()).unwrap();
+
     // If we're deaing with a single-threaded remote program that reads all its input at once, we have to tell it
     // when we're done, which would require either dropping `module.stdin` here (impossible because the wire has
     // taken ownership) or or sending some kind of manual EOF-like signal. This is the latter, and can be used
@@ -62,8 +65,12 @@ fn main() {
     let _: () = first_name_handle.wait().unwrap();
     let _: () = last_name_handle.wait().unwrap();
     let magic_number: u32 = magic_number_handle.wait().unwrap();
+    // This will get the streamed data directly, and will block until *all* of it is available (so it's being streamed
+    // in, but not streamed out)
+    let streamed_data: Vec<String> = stream_handle.wait_chunks().unwrap();
 
     println!("Magic number was {}!", magic_number);
+    println!("Streamed data was {:?}", streamed_data);
 
     // Wasm will automatically finish when it's done, but the multi-threaded non-Wasm module will hang around
     // waiting for further messages, so we'll explicitly signal a termination

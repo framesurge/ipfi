@@ -51,6 +51,14 @@ fn prepare() -> Wire<'static> {
     INTERFACE.add_procedure(2, |(last_name,): (String,)| {
         eprintln!("Got last name from host: {}!", last_name);
     });
+    INTERFACE.add_sequence_procedure(3, |yielder, (): ()| {
+        std::thread::spawn(move || {
+            yielder("This is a test".to_string(), false);
+            yielder(" of the system".to_string(), false);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            yielder("\nAnd this is a second test!".to_string(), true);
+        });
+    });
 
     // If we didn't need to call any procedures on the host, this could be `::new_module()` instead to
     // improve security

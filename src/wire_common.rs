@@ -11,7 +11,7 @@ macro_rules! define_wire {
         #[cfg(feature = "serde")]
         use $crate::procedure_args::ProcedureArgs;
         use $crate::wire_utils::*;
-        use $crate::{error::Error, CallIndex, IpfiInteger, ProcedureIndex, WireId};
+        use $crate::{error::Error, Terminator, CallIndex, IpfiInteger, ProcedureIndex, WireId};
         use crossbeam_queue::SegQueue;
         use dashmap::DashMap;
         use fxhash::FxBuildHasher;
@@ -27,6 +27,12 @@ macro_rules! define_wire {
         ///
         /// This wire sets up an internal message queue of data needing to be sent, allowing bidirectional messaging even over locked buffers (such as stdio)
         /// without leading to race conditions.
+        ///
+        /// Note that the process of reading messages from the other side of the wire will implicitly perform procedure calls to satisfy their requests. As such,
+        /// any failures in procedures will be propagated upward, failing this wire. If this behaviour is undesired, you should manually restart calls like `.fill()`
+        /// on any errors. Even in server scenarios, however, this behaviour is usually desired, as sending a response back to the client is extremely difficult.
+        /// Genuinely falible procedures are fully supported, and errors will be sent over the wire, by "failures in procedures", we are typically referring to
+        /// errors in serialising return types for transmission, or the like.
         ///
         /// # Termination
         ///
@@ -284,7 +290,7 @@ macro_rules! define_wire {
                     call_idx,
                     args,
                     // We can terminate in one go here
-                    terminator: true,
+                    terminator: Terminator::Complete,
                 };
                 // Convert that message into bytes and place it in the queue
                 let bytes = msg.to_bytes();
@@ -343,7 +349,7 @@ macro_rules! define_wire {
                     procedure_idx,
                     call_idx,
                     args,
-                    terminator: false,
+                    terminator: Terminator::None,
                 };
                 // Convert that message into bytes and place it in the queue
                 let bytes = msg.to_bytes();
@@ -372,7 +378,7 @@ macro_rules! define_wire {
                     procedure_idx,
                     call_idx,
                     args: &[],
-                    terminator: true,
+                    terminator: Terminator::Complete,
                 };
                 // Convert that message into bytes and place it in the queue
                 let bytes = msg.to_bytes();
@@ -440,8 +446,10 @@ macro_rules! define_wire {
             /// If a procedure call is completed in this read, this method will automatically block waiting for the response,
             /// and it will followingly add said response to the internal writer queue.
             ///
-            /// This returns whether or not it read a message/call termination message). Alternately, `None` will be returned
-            /// if there was a manual end of input message, or on a wire termination.
+            /// This returns whether or not it read a message/call termination message). Remember, however, that receiving
+            /// a call termination message does not mean the response to that call has been sent in the case of a streaming
+            /// procedure! Alternately, `None` will be returned if there was a manual end of input message, or on a wire
+            /// termination.
             pub $($async)? fn receive_one(
                 &self,
                 #[allow(unused_parens)]
@@ -464,8 +472,7 @@ macro_rules! define_wire {
                         let mut multiflag_buf = [0u8; 1];
                         reader.read_exact(&mut multiflag_buf)$(.$await)??;
                         let bits = u8_to_bool_array(multiflag_buf[0]);
-                        // The second-last bit represents whether or not this is the final message in its series
-                        let is_final = bits[6];
+                        let terminator = Terminator::from_flag((bits[6], bits[7]))?;
 
                         // Then the procedure index
                         let procedure_idx = Integer::from_flag((bits[0], bits[1]))
@@ -505,25 +512,43 @@ macro_rules! define_wire {
 
                                 // If this message was the last in its series, we should call the procedure, assuming we have all the arguments
                                 // we need
-                                if is_final {
+                                if terminator == Terminator::Complete {
                                     self.interface.terminate_message(call_buf_idx)$(.$await)??;
 
                                     // This will actually execute!
                                     // Note that this will remove the `call_buf_idx` mapping and drain the arguments out of that buffer
+                                    let self_queue = self.queue.clone();
                                     let ret = self
                                         .interface
-                                        .call_procedure(procedure_idx, call_idx, self.id)
+                                        .call_procedure(procedure_idx, call_idx, self.id, move |bytes, terminator| {
+                                            // TODO Need a way for this to send errors too...(third argument?)
+                                            let ret_msg = Message::Response {
+                                                procedure_idx,
+                                                call_idx,
+                                                message: &bytes,
+                                                terminator,
+                                            };
+                                            let ret_msg_bytes = ret_msg.to_bytes();
+                                            self_queue.push(ret_msg_bytes);
+                                        })
                                         $(.$await)??;
-                                    let ret_msg = Message::Response {
-                                        procedure_idx,
-                                        call_idx,
-                                        message: &ret,
-                                        terminator: true,
-                                    };
-                                    let ret_msg_bytes = ret_msg.to_bytes();
-                                    self.queue.push(ret_msg_bytes);
+                                    // We can only send a response immediately if this isn't a streaming procedure
+                                    if let Some(ret_bytes) = ret {
+                                        let ret_msg = Message::Response {
+                                            procedure_idx,
+                                            call_idx,
+                                            message: &ret_bytes,
+                                            terminator: Terminator::Complete,
+                                        };
+                                        let ret_msg_bytes = ret_msg.to_bytes();
+                                        self.queue.push(ret_msg_bytes);
+                                    }
+
+                                    // Regardless, we did read a call termination message
                                     Ok(Some(true))
                                 } else {
+                                    // Chunks are not a thing for arguments (they're not needed, we know from the procedure
+                                    // definition how to serialise/deserialise, specifically we know the number of arguments!)
                                     Ok(Some(false))
                                 }
                             }
@@ -535,7 +560,9 @@ macro_rules! define_wire {
 
                                 // If this is marked as the last in its series, we should round off the response message and
                                 // implicitly signal to any waiting call handles that it's ready to be read
-                                if is_final {
+                                if terminator == Terminator::Complete {
+                                    // Remember that we need to increment the chunk count before terminating the message!
+                                    self.interface.increment_chunk_count(response_idx)$(.$await)??;
                                     self.interface.terminate_message(response_idx)$(.$await)??;
                                     // If that succeeded, the user should be ready to fetch that, and the index will be reused
                                     // after they have, so we should remove it from this map (this is to save space only, because we
@@ -543,6 +570,10 @@ macro_rules! define_wire {
                                     self.response_idx_map.remove(&(procedure_idx, call_idx));
 
                                     Ok(Some(true))
+                                } else if terminator == Terminator::Chunk {
+                                    self.interface.increment_chunk_count(response_idx)$(.$await)??;
+                                    // Chunk terminations don't count as message terminations
+                                    Ok(Some(false))
                                 } else {
                                     Ok(Some(false))
                                 }
@@ -691,11 +722,18 @@ macro_rules! define_wire {
             interface: &'a Interface,
         }
         impl<'a> CallHandle<'a> {
-            /// Waits for the procedure call to complete and returns the result. This will block.
+            /// Waits for the procedure call to complete and returns the result.
             #[cfg(feature = "serde")]
             #[inline]
             pub $($async)? fn wait<T: DeserializeOwned>(&self) -> Result<T, Error> {
                 self.interface.get(self.response_idx)$(.$await)?
+            }
+            /// Same as `.wait()`, but this will use chunk-based deserialisation, and is intended for use with procedures that send
+            /// sequences of discrete values gradually over the wire. For more information, see [`Interface::get_chunks`].
+            #[cfg(feature = "serde")]
+            #[inline]
+            pub $($async)? fn wait_chunks<T: DeserializeOwned>(&self) -> Result<Vec<T>, Error> {
+                self.interface.get_chunks(self.response_idx)$(.$await)?
             }
             /// Same as `.wait()`, but this works directly with bytes.
             #[inline]

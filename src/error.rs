@@ -40,4 +40,6 @@ pub enum Error {
     CallFromModule,
     #[error("read an index that didn't fit into local integer type (perhaps switch to a higher `int-*` feature?)")]
     IdxTooBig,
+    #[error("read a non-compliant terminator `01` (valid values are `00`, `10`, and `11`)")]
+    InvalidTerminator,
 }
