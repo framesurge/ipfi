@@ -13,7 +13,7 @@ macro_rules! define_wire {
         use $crate::wire_utils::*;
         use $crate::{error::Error, Terminator, CallIndex, IpfiInteger, ProcedureIndex, WireId};
         use crossbeam_queue::SegQueue;
-        use dashmap::DashMap;
+        use dashmap::{DashMap, DashSet};
         use fxhash::FxBuildHasher;
         use nohash_hasher::BuildNoHashHasher;
         #[cfg(feature = "serde")]
@@ -23,6 +23,8 @@ macro_rules! define_wire {
             Arc,
         };
         use super::ChunkReceiver;
+
+        const DEFAULT_MAX_ONGOING_PROCEDURES: IpfiInteger = 25; // TODO
 
         /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
         ///
@@ -99,9 +101,22 @@ macro_rules! define_wire {
             /// A map of procedure and call indices (respectively) to local response buffer indices. Once an entry is added here, it should never be changed until
             /// it is removed.
             ///
-            /// This serves as a secuirty mechanism to ensure that response messages are mapped *locally* to response buffer indices, which means we can be sure
+            /// This serves as a security mechanism to ensure that response messages are mapped *locally* to response buffer indices, which means we can be sure
             /// that a remote cannot access and control arbitrary message buffers on our local interface, thereby compromising other wires.
             response_idx_map: Arc<DashMap<(ProcedureIndex, CallIndex), IpfiInteger, FxBuildHasher>>,
+            /// A set of procedure and call indices (respectively) that are actively accumulating arguments. The entries in here will be removed
+            /// as the procedure call's response has been completely streamed, hence this partly mirrors the contents
+            /// of the interface's `call_to_buf_map`. This is needed for when the wire is dropped, allowing us to instruct the interface to
+            /// drop in-progress procedure calls that wouldn't otherwise complete, preventing a denial-of-service attack based on exhausting
+            /// memory by creating many partial procedure call fragments across different wires. A
+            ///
+            /// The length of this set is also monitored to impose a limit on the number of procedure calls a single wire can simultaneously
+            /// call (another type of DoS attack).
+            ongoing_procedures: Arc<DashSet<(ProcedureIndex, CallIndex), FxBuildHasher>>,
+            /// The maximum number of procedures that the other side of this wire is allowed to accumulate arguments for or execute
+            /// simultaneously. This is used to prevent DoS attacks based on sending partial arguments for many calls, or based on
+            /// executing resource-heavy procedures en-masse.
+            max_ongoing_procedures: IpfiInteger,
             /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
             terminated: Arc<AtomicBool>,
         }
@@ -128,6 +143,8 @@ macro_rules! define_wire {
                     queue: Arc::new(SegQueue::new()),
                     remote_call_counter: Arc::new(DashMap::default()),
                     response_idx_map: Arc::new(DashMap::default()),
+                    ongoing_procedures: Arc::new(DashSet::default()),
+                    max_ongoing_procedures: DEFAULT_MAX_ONGOING_PROCEDURES,
 
                     // If we detect an EOF, this will be set
                     terminated: Arc::new(AtomicBool::new(false)),
@@ -144,6 +161,8 @@ macro_rules! define_wire {
                     queue: Arc::new(SegQueue::new()),
                     remote_call_counter: Arc::new(DashMap::default()),
                     response_idx_map: Arc::new(DashMap::default()),
+                    ongoing_procedures: Arc::new(DashSet::default()),
+                    max_ongoing_procedures: DEFAULT_MAX_ONGOING_PROCEDURES,
 
                     // If we detect an EOF, this will be set
                     terminated: Arc::new(AtomicBool::new(false)),
@@ -435,7 +454,10 @@ macro_rules! define_wire {
                 let bytes = msg.to_bytes();
                 self.queue.push(bytes);
             }
-            /// Sets the internal termination flag to `true`, causing all subsequent operations to fail.
+            /// Sets the internal termination flag to `true`, causing all subsequent operations to fail. This will also cause all
+            /// ongoing streaming procedures to have their next `yielder()` call return an error, leading them to fail (in most cases).
+            /// In other words, this will single-handedly terminate all active work on this wire. However, buffers allocated for
+            /// accumulating procedure call arguments will only be dropped once the wire itself is dropped.
             fn mark_terminated(&self) {
                 // We use `Ordering::Release` to make sure that all subsequent reads see this
                 self.terminated.store(true, Ordering::Release);
@@ -465,7 +487,7 @@ macro_rules! define_wire {
                 reader.read_exact(&mut ty_buf)$(.$await)??;
                 let ty = u8::from_le_bytes(ty_buf);
                 match ty {
-                    // Expressly ignorre general messages if we're a module
+                    // Expressly ignore response messages if we're a module
                     2 if self.module_style => Ok(Some(false)),
                     // Procedure call or response thereto (same base format)
                     1 | 2 => {
@@ -504,10 +526,18 @@ macro_rules! define_wire {
                         match ty {
                             // Call
                             1 => {
+                                // If this is a new call and it would break the limit of ongoing procedures, don't let it through
+                                if !self.ongoing_procedures.contains(&(procedure_idx, call_idx)) && self.ongoing_procedures.len() >= self.max_ongoing_procedures as usize {
+                                    // TODO Need to send an explicit error message back here
+                                    return Ok(Some(false))
+                                }
                                 // We need to know where to put argument information
                                 let call_buf_idx = self
                                     .interface
                                     .get_call_buffer(procedure_idx, call_idx, self.id)$(.$await)?;
+                                // Make sure this is registered as an ongoing procedure call (even if it immediately finishes, there might be an
+                                // error that could have been deliberately caused, and we don't want to take any chances with DoS attacks)
+                                self.ongoing_procedures.insert((procedure_idx, call_idx));
                                 // And now put it there, accumulating across many messages as necessary
                                 self.interface.send_many(&bytes, call_buf_idx)$(.$await)??;
 
@@ -519,9 +549,16 @@ macro_rules! define_wire {
                                     // This will actually execute!
                                     // Note that this will remove the `call_buf_idx` mapping and drain the arguments out of that buffer
                                     let self_queue = self.queue.clone();
+                                    let ongoing_procedures = self.ongoing_procedures.clone();
+                                    let terminated = self.terminated.clone();
                                     let ret = self
                                         .interface
                                         .call_procedure(procedure_idx, call_idx, self.id, move |bytes, terminator| {
+                                            // If we've terminated, all ongoing procedures should be informed the next time they yield a value
+                                            // to prevent unnecessary computations and potential DoS attempts
+                                            if terminated.load(Ordering::Acquire) {
+                                                return Err(Error::WireTerminated)
+                                            }
                                             // TODO Need a way for this to send errors too...(third argument?)
                                             let ret_msg = Message::Response {
                                                 procedure_idx,
@@ -531,6 +568,12 @@ macro_rules! define_wire {
                                             };
                                             let ret_msg_bytes = ret_msg.to_bytes();
                                             self_queue.push(ret_msg_bytes);
+                                            // If this call is complete, remove it from the list of ongoing procedures
+                                            if terminator == Terminator::Complete {
+                                                ongoing_procedures.remove(&(procedure_idx, call_idx));
+                                            }
+
+                                            Ok(())
                                         })
                                         $(.$await)??;
                                     // We can only send a response immediately if this isn't a streaming procedure
@@ -543,6 +586,8 @@ macro_rules! define_wire {
                                         };
                                         let ret_msg_bytes = ret_msg.to_bytes();
                                         self.queue.push(ret_msg_bytes);
+                                        // This call is complete, remove it from the ongoing procedures registry
+                                        self.ongoing_procedures.remove(&(procedure_idx, call_idx));
                                     }
 
                                     // Regardless, we did read a call termination message
@@ -700,9 +745,18 @@ macro_rules! define_wire {
                 }
             }
         }
-        // Dropping the wire must also relinquish the unique wire identifier
+        // Dropping the wire must:
+        //  1. Mark it as terminated to make any ongoing streaming procedures terminate (at their discretion),
+        //  2. Drop all messages for procedure calls that were still accumulating, to prevent memroy-based DoS attacks,
+        //  3. And relinquish this wire's identifier so it can be reused on the interface.
         impl Drop for Wire<'_> {
             fn drop(&mut self) {
+                // Useful because this `Arc<AtomicBool>` is shared with all ongoing streaming procedures
+                self.mark_terminated();
+                for entry in self.ongoing_procedures.iter() {
+                    self.interface.drop_associated_call_message(entry.0, entry.1, self.id);
+                }
+                // Relinquish the ID last to prevent nasty race conditions
                 self.interface.relinquish_id(self.id);
             }
         }

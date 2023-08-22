@@ -26,7 +26,7 @@ pub(crate) enum Procedure {
         #[allow(clippy::type_complexity)]
         closure: Box<
             dyn Fn(
-                    Box<dyn Fn(Vec<u8>, Terminator) + Send + Sync + 'static>,
+                    Box<dyn Fn(Vec<u8>, Terminator) -> Result<(), Error> + Send + Sync + 'static>,
                     &[u8],
                 ) -> Result<(), Error>
                 + Send
@@ -203,11 +203,25 @@ macro_rules! define_interface {
             }
             /// Marks the given wire identifier as relinquished. This will return it into the queue and recirculate it to the next
             /// new wire that requests an identifier. As such, the provided identifier *must not* be reused after it is provided to this
-            /// call.
+            /// call. Any messages associated with this wire identifier will be popped automatically if this is called with
+            /// `pop_messages`, which it generally should be in server-like contexts (otherwise, a client could cause an out-of-memory
+            /// error by submitting just shy of enough arguments for the same procedure many times over different wires).
             ///
             /// Generally, this should be called within drop implementations, and it is not necessary to call this for the inbuilt [`Wire`].
             pub fn relinquish_id(&self, id: WireId) {
                 self.wire_id_queue.relinquish(id.0);
+            }
+            /// Drops the message associated with accumulating arguments for the given procedure call. This could be called for both procedures
+            /// that are still accumulating arguments and for those that are done accumulating, but which are still streaming. As these buffers
+            /// have already been created, creation locks will never be an issue, while waiting for a completion lock would lead to waiting
+            /// forever, as the internal lock would persist, but the version of it held by the interface would be dropped (however, waiting
+            /// on completion locks for argument accumulation buffers would be very strange).
+            pub fn drop_associated_call_message(&self, procedure_idx: ProcedureIndex, call_idx: CallIndex, wire_id: WireId) {
+                if let Some((_, message_id)) = self.call_to_buffer_map.remove(&(procedure_idx, call_idx, wire_id)) {
+                    // This will deal with recycling the ID appropriately
+                    self.pop(message_id);
+                }
+
             }
             /// Adds the given function as a procedure on this interface, which will allow other programs interacting with
             /// this one to execute it. Critically, no validation of intent or origin is requires to remotely execute procedures
@@ -268,9 +282,9 @@ macro_rules! define_interface {
             >(
                 &self,
                 idx: IpfiInteger,
-                f: impl Fn(Box<dyn Fn(R, bool) + Send + Sync + 'static>, A) + Send + Sync + 'static,
+                f: impl Fn(Box<dyn Fn(R, bool) -> Result<(), Error> + Send + Sync + 'static>, A) + Send + Sync + 'static,
             ) {
-                let closure = Box::new(move |raw_yielder: Box<dyn Fn(Vec<u8>, Terminator) + Send + Sync + 'static>, data: &[u8]| {
+                let closure = Box::new(move |raw_yielder: Box<dyn Fn(Vec<u8>, Terminator) -> Result<(), Error> + Send + Sync + 'static>, data: &[u8]| {
                     // Add the correct length prefix so this can be deserialized as the tuple it is (this is what allows
                     // piecemeal argument transmission)
                     let arg_tuple = if A::len() == 0 {
@@ -285,9 +299,9 @@ macro_rules! define_interface {
                         rmp_serde::decode::from_slice(&bytes)?
                     };
                     let yielder = Box::new(move |data: R, is_final: bool| {
-                        let data = rmp_serde::encode::to_vec(&data).expect("TODO: error message system for failures like this");
+                        let data = rmp_serde::encode::to_vec(&data)?;
                         let terminator = if is_final { Terminator::Complete } else { Terminator::Chunk };
-                        raw_yielder(data, terminator);
+                        raw_yielder(data, terminator)
                     });
 
                     f(yielder, arg_tuple);
@@ -342,7 +356,7 @@ macro_rules! define_interface {
             pub fn add_raw_streaming_procedure(
                 &self,
                 idx: IpfiInteger,
-                f: impl Fn(Box<dyn Fn(Vec<u8>, Terminator) + Send + Sync + 'static>, &[u8]) + Send + Sync + 'static,
+                f: impl Fn(Box<dyn Fn(Vec<u8>, Terminator) -> Result<(), Error> + Send + Sync + 'static>, &[u8]) + Send + Sync + 'static,
             ) {
                 let procedure = Procedure::Streaming {
                     closure: Box::new(move |yielder, data: &[u8]| {
@@ -377,7 +391,7 @@ macro_rules! define_interface {
                 procedure_idx: ProcedureIndex,
                 call_idx: CallIndex,
                 wire_id: WireId,
-                yielder: impl Fn(Vec<u8>, Terminator) + Send + Sync + 'static,
+                yielder: impl Fn(Vec<u8>, Terminator) -> Result<(), Error> + Send + Sync + 'static,
             ) -> Result<Option<Vec<u8>>, Error> {
                 // Get the buffer where the arguments are supposed to be, and then delete that mapping to free up some space
                 let args_buf_idx = self.get_call_buffer(procedure_idx, call_idx, wire_id)$(.$await)?;
