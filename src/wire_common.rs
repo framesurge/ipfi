@@ -748,6 +748,15 @@ macro_rules! define_wire {
             pub $($async)? fn wait_bytes(&self) -> Vec<Vec<u8>> {
                 self.interface.get_raw(self.response_idx)$(.$await)?
             }
+            /// Turns this call handle into the response index that can be used directly with the [`Interface`].
+            /// This allows using lower-level methods on the interface that aren't accessible on the call
+            /// handle, but you generally won't need these.
+            ///
+            /// This is typically required when you want to check whether or not a call handle is ready
+            /// to yield.
+            pub fn into_response_idx(self) -> IpfiInteger {
+                self.response_idx
+            }
         }
 
         /// Signals the termination of this program to any others that may be holding wires to it.
@@ -1090,6 +1099,66 @@ macro_rules! define_wire_tests {
             let result = handle.unwrap().wait::<String>()$(.$await)?;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), "Hello, John Doe!");
+        }
+        #[cfg(feature = "serde")]
+        #[$test_attr]
+        $($async)? fn streaming_procedure_should_work() {
+            let mut alice = Actor::new();
+            let mut bob = Actor::new();
+            alice
+                .interface
+                .add_sequence_procedure(0, |yielder, (): ()| {
+                    yielder(1, false);
+                    yielder(2, false);
+                    // TODO Way of testing when we don't terminate properly?
+                    yielder(3, true);
+                });
+
+            let handle = bob.wire.call(ProcedureIndex(0), ())$(.$await)?;
+            assert!(handle.is_ok());
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+
+            let result = handle.unwrap().wait_chunks::<u32>()$(.$await)?;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().unwrap(), [1, 2, 3]);
+        }
+        #[$test_attr]
+        $($async)? fn streaming_both_ends_should_work() {
+            let mut alice = Actor::new();
+            let mut bob = Actor::new();
+            alice
+                .interface
+                .add_sequence_procedure(0, |yielder, (): ()| {
+                    // We don't bother with proper delays or the like here, thread management
+                    // etc. is solely the responsibility of this function (so we would just
+                    // be testing Rust's threading systems, which is redundant)
+                    yielder(1, false);
+                    yielder(2, false);
+                    yielder(3, true);
+                });
+
+            let handle = bob.wire.call(ProcedureIndex(0), ())$(.$await)?;
+            assert!(handle.is_ok());
+            let mut rx = handle.unwrap().wait_chunk_stream()$(.$await)?;
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [1]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [2]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [3]);
+
+            assert!(rx.recv_raw()$(.$await)?.is_none());
         }
     };
 }

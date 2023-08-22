@@ -514,7 +514,7 @@ macro_rules! define_interface {
             /// has already been terminated or if it was out-of-bounds. This will not change anything about the
             /// chunk layout of the message, and, for the final chunk, this should be called *instead of* terminating
             /// the chunk, otherwise an additional, empty chunk will be created. If there is a chunk receiver registered,
-            /// this will send the final chunk through it.
+            /// this will send the final chunk through it (only if that chunk hasn't been sent before).
             ///
             /// For messages with real-time chunk receivers registered, this will drop the only sender, thus ending
             /// the channel.
@@ -660,6 +660,7 @@ macro_rules! define_interface {
                 if message_ref.sender.is_some() {
                     return Ok(None);
                 }
+                drop(message_ref);
                 // We've already manually waited on the message, so we can safely directly pop it out
                 let MessageBuffer { chunks, .. } = self.pop(message_id).unwrap();
 
@@ -877,6 +878,63 @@ macro_rules! define_interface_tests {
             let msg = interface.get_raw(id)$(.$await)?;
             assert_eq!(msg[0], []);
         }
-        // TODO Chunk tests
+        #[$test_attr]
+        $($async)? fn chunk_streaming_should_work() {
+            let interface = Interface::new();
+            let id = interface.push()$(.$await)?;
+            // This will resolve immediately because the message has been created
+            let mut rx = interface.get_chunk_stream(id)$(.$await)?;
+
+            interface.send(42, id)$(.$await)?.unwrap();
+            interface.terminate_chunk(id)$(.$await)?.unwrap();
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [42]);
+            interface.send(43, id)$(.$await)?.unwrap();
+            // We don't terminate that final chunk!
+            interface.terminate_message(id)$(.$await)?.unwrap();
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [43]);
+
+            assert!(rx.recv_raw()$(.$await)?.is_none());
+
+            // Getting the buffer itself should fail or be empty, depending on the method used
+            #[cfg(feature = "serde")]
+            assert!(interface.get_chunks::<()>(id)$(.$await)?.unwrap().is_none());
+            assert_eq!(interface.get_raw(id)$(.$await)?, [[]]);
+        }
+        #[$test_attr]
+        $($async)? fn stream_then_drop_rx_should_buffer() {
+            let interface = Interface::new();
+            let id = interface.push()$(.$await)?;
+            // This will resolve immediately because the message has been created
+            let mut rx = interface.get_chunk_stream(id)$(.$await)?;
+
+            interface.send(42, id)$(.$await)?.unwrap();
+            interface.terminate_chunk(id)$(.$await)?.unwrap();
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [42]);
+            // Now drop the receiver: future chunks should be buffered
+            drop(rx);
+            interface.send(43, id)$(.$await)?.unwrap();
+            // We don't terminate that final chunk!
+            interface.terminate_message(id)$(.$await)?.unwrap();
+
+            // Getting the buffer itself should fail, but, getting the raw bytes should show
+            // the last chunk buffered (as it couldn't be sent)
+            #[cfg(feature = "serde")]
+            assert!(interface.get_chunks::<()>(id)$(.$await)?.unwrap().is_none());
+            assert_eq!(interface.get_raw(id)$(.$await)?, [[43]]);
+        }
+        #[cfg(feature = "serde")]
+        #[$test_attr]
+        $($async)? fn get_chunks_should_work() {
+            let interface = Interface::new();
+            let id = interface.push()$(.$await)?;
+
+            interface.send(42, id)$(.$await)?.unwrap();
+            interface.terminate_chunk(id)$(.$await)?.unwrap();
+            interface.send(43, id)$(.$await)?.unwrap();
+            // We don't terminate that final chunk!
+            interface.terminate_message(id)$(.$await)?.unwrap();
+
+            assert_eq!(interface.get_chunks::<u32>(id)$(.$await)?.unwrap().unwrap(), [42, 43]);
+        }
     };
 }
