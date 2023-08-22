@@ -65,9 +65,7 @@ fn main() {
     let _: () = first_name_handle.wait().unwrap();
     let _: () = last_name_handle.wait().unwrap();
     let magic_number: u32 = magic_number_handle.wait().unwrap();
-    // This will get the streamed data directly, and will block until *all* of it is available (so it's being streamed
-    // in, but not streamed out)
-    // We haven't listened to it in real-time, so we know there will be data there
+    // This creates a receiver that can be used to get streamed chunks in real-time
     let mut data_rx = stream_handle.wait_chunk_stream();
 
     println!("Magic number was {}!", magic_number);
