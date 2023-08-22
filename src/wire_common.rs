@@ -22,6 +22,7 @@ macro_rules! define_wire {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
+        use super::ChunkReceiver;
 
         /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
         ///
@@ -561,8 +562,7 @@ macro_rules! define_wire {
                                 // If this is marked as the last in its series, we should round off the response message and
                                 // implicitly signal to any waiting call handles that it's ready to be read
                                 if terminator == Terminator::Complete {
-                                    // Remember that we need to increment the chunk count before terminating the message!
-                                    self.interface.increment_chunk_count(response_idx)$(.$await)??;
+                                    // We don't terminate the final chunk (that would create an extra empty chunk)
                                     self.interface.terminate_message(response_idx)$(.$await)??;
                                     // If that succeeded, the user should be ready to fetch that, and the index will be reused
                                     // after they have, so we should remove it from this map (this is to save space only, because we
@@ -571,7 +571,7 @@ macro_rules! define_wire {
 
                                     Ok(Some(true))
                                 } else if terminator == Terminator::Chunk {
-                                    self.interface.increment_chunk_count(response_idx)$(.$await)??;
+                                    self.interface.terminate_chunk(response_idx)$(.$await)??;
                                     // Chunk terminations don't count as message terminations
                                     Ok(Some(false))
                                 } else {
@@ -732,12 +732,20 @@ macro_rules! define_wire {
             /// sequences of discrete values gradually over the wire. For more information, see [`Interface::get_chunks`].
             #[cfg(feature = "serde")]
             #[inline]
-            pub $($async)? fn wait_chunks<T: DeserializeOwned>(&self) -> Result<Vec<T>, Error> {
+            pub $($async)? fn wait_chunks<T: DeserializeOwned>(&self) -> Result<Option<Vec<T>>, Error> {
                 self.interface.get_chunks(self.response_idx)$(.$await)?
             }
-            /// Same as `.wait()`, but this works directly with bytes.
+            /// Creates a [`ChunkReceiver`] for incrementally receiving each chunk as it arrives. This can be used for accessing
+            /// data in a semi-realtime way while still abstracting over the issue of partial chunks. This will wait until the
+            /// first response data is received before creating a channel.
             #[inline]
-            pub $($async)? fn wait_bytes(&self) -> Vec<u8> {
+            pub $($async)? fn wait_chunk_stream(&self) -> ChunkReceiver {
+                self.interface.get_chunk_stream(self.response_idx)$(.$await)?
+            }
+            /// Same as `.wait()`, but this works directly with bytes. This will return the chunks in the message (to learn more about
+            /// chunks, see [`Interface`]).
+            #[inline]
+            pub $($async)? fn wait_bytes(&self) -> Vec<Vec<u8>> {
                 self.interface.get_raw(self.response_idx)$(.$await)?
             }
         }
@@ -822,7 +830,7 @@ macro_rules! define_wire_tests {
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
             let result = handle.unwrap().wait_bytes()$(.$await)?;
-            assert_eq!(result, [0, 1, 2, 3, 42]);
+            assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[$test_attr]
         $($async)? fn two_bytes_calls_should_use_correct_call_indices() {
@@ -855,7 +863,7 @@ macro_rules! define_wire_tests {
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
             let result = handle.wait_bytes()$(.$await)?;
-            assert_eq!(result, [0, 1, 2, 3, 42]);
+            assert_eq!(result[0], [0, 1, 2, 3, 42]);
 
             // Test cleanup
             alice.input = Cursor::new(Vec::new());
@@ -881,7 +889,7 @@ macro_rules! define_wire_tests {
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
             let result = handle.wait_bytes()$(.$await)?;
-            assert_eq!(result, [0, 1, 2, 3, 42]);
+            assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[$test_attr]
         $($async)? fn partial_bytes_call_should_work() {
@@ -926,7 +934,7 @@ macro_rules! define_wire_tests {
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
             let result = handle.unwrap().wait_bytes()$(.$await)?;
-            assert_eq!(result, [0, 1, 2, 3, 42]);
+            assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[$test_attr]
         $($async)? fn other_side_should_pick_up_send_after_end() {
@@ -965,7 +973,7 @@ macro_rules! define_wire_tests {
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
             let result = handle.unwrap().wait_bytes()$(.$await)?;
-            assert_eq!(result, [0, 1, 2, 3, 42]);
+            assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[cfg(feature = "serde")]
         #[$test_attr]

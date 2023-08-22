@@ -1,3 +1,5 @@
+use std::sync::mpsc::{channel, Receiver, Sender};
+
 crate::define_interface!();
 
 #[cfg(test)]
@@ -41,7 +43,7 @@ mod tests {
         interface.terminate_message(id).unwrap();
 
         let msg = msg.join().unwrap();
-        assert_eq!(msg, [42]);
+        assert_eq!(msg[0], [42]);
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -67,6 +69,6 @@ mod tests {
         interface.terminate_message(0).unwrap();
 
         let msg = msg.join().unwrap();
-        assert_eq!(msg, [42]);
+        assert_eq!(msg[0], [42]);
     }
 }

@@ -1,3 +1,7 @@
+use tokio::sync::mpsc::{
+    unbounded_channel as channel, UnboundedReceiver as Receiver, UnboundedSender as Sender,
+};
+
 crate::define_interface!(async, await);
 
 #[cfg(test)]
@@ -40,7 +44,7 @@ mod tests {
         interface.terminate_message(id).await.unwrap();
 
         let msg = msg.await.unwrap();
-        assert_eq!(msg, [42]);
+        assert_eq!(msg[0], [42]);
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
@@ -66,6 +70,6 @@ mod tests {
         interface.terminate_message(0).await.unwrap();
 
         let msg = msg.await.unwrap();
-        assert_eq!(msg, [42]);
+        assert_eq!(msg[0], [42]);
     }
 }

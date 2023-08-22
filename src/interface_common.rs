@@ -48,12 +48,76 @@ macro_rules! define_interface {
         use $crate::procedure_args::Tuple;
         use $crate::roi_queue::RoiQueue;
         use $crate::{CallIndex, Terminator, IpfiInteger, ProcedureIndex, WireId};
-        use dashmap::DashMap;
+        use dashmap::{DashMap, mapref::one::Ref};
         use fxhash::FxBuildHasher;
         use nohash_hasher::BuildNoHashHasher;
         #[cfg(feature = "serde")]
         use serde::{de::DeserializeOwned, Serialize};
         use $crate::interface_common::Procedure;
+        // Regardless of async or not, we'll still use the std mutex
+        use std::sync::Mutex;
+
+        /// A single message held by an [`Interface`].
+        pub(crate) struct MessageBuffer {
+            /// The chunks in this message. As each chunk is terminated, a new one will be started. At
+            /// all stages, new bytes will be appended to the last chunk. Importantly, chunks are defined
+            /// by the sender of the message (e.g. they may be token streams), and hence are not fixed-size.
+            ///
+            /// Note that the majority of messages will be single-chunk, and even some streaming procedures
+            /// will only send one chunk. For instance, a streaming procedure may be defined that sends
+            /// bytes gradually, but, altogether, those bytes make up a single deserialisable object.
+            chunks: Vec<Vec<u8>>,
+            /// A lock representing whether or not the buffer is completed. This is not held for individual
+            /// chunks.
+            complete_lock: CompleteLock,
+            /// A sender through which we can send chunks. This works with raw bytes, and the end receiver
+            /// will be wrapped in a function capable of deserialising each individual chunk. This is locked
+            /// to ensure it can be shared between threads, but this should be completely deadlock-safe,
+            /// as only one person can access the `MessageBuffer` itself at a time (mutably, at least, so
+            /// we do need to enforce the semantics of mutable borrowing for sending).
+            ///
+            /// The `Option` inside the `Mutex` is used to allow dropping the sender once a message has been
+            /// terminated, hence ending the real-time stream, while retaining the information that there was
+            /// once a sender (and hence that the message may be corrupted).
+            // Whether this sender is from `tokio` or `std` depends on the import context this macro is
+            // used in
+            sender: Option<Mutex<Option<Sender<Vec<u8>>>>>,
+        }
+
+        /// A wrapper that allows receiving message chunks in real-time. Be mindful that, once one of these is created,
+        /// all chunks that arrive for the message it tracks will be immediately sent to it, thereby preventing any
+        /// calls to `.get()` on the [`Interface`] from accessing non-empty data.
+        pub struct ChunkReceiver {
+            // The type of this will depend on the import context in which this macro is used
+            rx: Receiver<Vec<u8>>,
+        }
+        impl ChunkReceiver {
+            fn new(rx: Receiver<Vec<u8>>) -> Self {
+                Self { rx }
+            }
+            /// Waits to receive the raw bytes of the next chunk.
+            pub $($async)? fn recv_raw(&mut self) -> Option<Vec<u8>> {
+                // The Tokio channels use `Option`, while the `std` ones use `Result`, hence this
+                // wizardry
+                self.rx.recv()$(.$await.ok_or(()))?.ok()
+            }
+            /// Waits to receive the next chunk, deserialising it into the given type. Generally, all chunks will be
+            /// deserialised into the same type, however it is perfeclty possible, if there is a known type layout,
+            /// to deserialise one chunk as one type and a different one as another, although this is not recommended
+            /// except in highly deterministic systems.
+            #[cfg(feature = "serde")]
+            pub $($async)? fn recv<T: DeserializeOwned>(&mut self) -> Option<Result<T, Error>> {
+                if let Ok(bytes) = self.rx.recv()$(.$await.ok_or(()))? {
+                    let decoded = match rmp_serde::decode::from_slice(&bytes) {
+                        Ok(decoded) => decoded,
+                        Err(err) => return Some(Err(err.into()))
+                    };
+                    Some(Ok(decoded))
+                } else {
+                    None
+                }
+            }
+        }
 
         /// An inter-process communication (IPC) interface based on the arbitrary reception of bytes.
         ///
@@ -67,12 +131,29 @@ macro_rules! define_interface {
         /// to send multiple messages simultaneously, while multiple receivers simultaneously wait for multiple
         /// messages. Once a message is accumulated, it will be stored in the buffer until the interface is
         /// dropped.
+        ///
+        /// # Chunks
+        ///
+        /// Messages sent to an IPFI interface are sent as raw bytes, however, with the `serde` feature enabled, they can
+        /// be deserialised into arbitrary types. Usually, a message will consist of only one type, however, sometimes,
+        /// especially in the case of a procedure that yields multiple independent values (e.g. strings), a single message
+        /// will consist of multiple discrete packets, all of which should be deserialised independently. For this use-case,
+        /// IPFI implements a chunking system, whereby senders to an interface can explicitly terminate an individual chunk,
+        /// before starting a new one. As a result, accessing the raw bytes of a message will yield a `Vec<Vec<u8>>`, a list
+        /// of chunks (each of which is a list of bytes).
+        ///
+        /// Sometimes, one may wish to access chunks in real-time, as they are terminated individually, and this can be done
+        /// through `.get_chunk_stream()`, which will return a [`ChunkReceiver`] that handles deserialisation. However, if this
+        /// method is called, then, every time a chunk is terminated, it will unquestioningly be sent to the receiver, rather than
+        /// being saved in the message buffer. Hence, after a real-time receiver is created, calls to methods like `.get()` will
+        /// still succeed, but they will return empty messages. Only `.get_chunks()` is wise to this: it will explicitly make
+        /// sure that no real-time interface is present before accessing the underlying message data. Note that, regardless of
+        /// the methods called, it is impossible for messages to enter a broken state, provided they were entered into the interface
+        /// correctly.
         pub struct Interface {
             /// The messages received over the interface. This is implemented as a concurrent hash map indexed by a `IpfiInteger`,
             /// which means that, when a message is read, we can remove its entry from the map entirely and its identifier can
-            /// be relinquished into a reuse-or-increment queue. The second entry in the value tuple is a chunk count, used for
-            /// allowing length-aware deserialisation of streamed lists of discrete packets.
-            messages: DashMap<IpfiInteger, (Vec<u8>, IpfiInteger, CompleteLock), BuildNoHashHasher<IpfiInteger>>,
+            messages: DashMap<IpfiInteger, MessageBuffer, BuildNoHashHasher<IpfiInteger>>,
             /// A queue that produces unique message identifiers while allowing us to recycle old ones. This enables far greater
             /// memory efficiency.
             message_id_queue: RoiQueue,
@@ -81,7 +162,7 @@ macro_rules! define_interface {
             /// indices, this has to be implemented this way!
             creation_locks: DashMap<IpfiInteger, CompleteLock, BuildNoHashHasher<IpfiInteger>>,
             /// A list of procedures registered on this interface that those communicating with this
-            /// program may execute.
+            /// program may execute. This amalgamates both streaming and standard procedures together.
             procedures: DashMap<ProcedureIndex, Procedure, BuildNoHashHasher<IpfiInteger>>,
             /// A map of procedure call indices and the wire IDs that produced them to local message buffer addresses.
             /// These are necessary because, when a program sends a partial procedure call, and then later completes it,
@@ -274,7 +355,7 @@ macro_rules! define_interface {
             }
             /// Deletes the given message buffer and relinquishes its unique identifier back into
             /// the queue for reuse. This must be provided an ID that was previously issued by `.push()`.
-            fn pop(&self, id: IpfiInteger) -> Option<(Vec<u8>, IpfiInteger, CompleteLock)> {
+            fn pop(&self, id: IpfiInteger) -> Option<MessageBuffer> {
                 if let Some((_id, val)) = self.messages.remove(&id) {
                     self.message_id_queue.relinquish(id);
                     Some(val)
@@ -305,13 +386,15 @@ macro_rules! define_interface {
 
                 if let Some(procedure) = self.procedures.get(&procedure_idx) {
                     if let Some(m) = self.messages.get(&args_buf_idx) {
-                        let (args, _chunk_count, complete_lock) = m.value();
-                        if complete_lock.completed()$(.$await)? {
+                        let message = m.value();
+                        if message.complete_lock.completed()$(.$await)? {
                             // The length marker will be inserted by the internal wrapper closure
                             let ret = match &*procedure {
-                                Procedure::Standard { closure } => (closure)(args).map(|val| Some(val)),
+                                // Note that we always know there will be at least one chunk, so this can
+                                // never panic (and procedure calls are never chunked)
+                                Procedure::Standard { closure } => (closure)(&message.chunks[0]).map(|val| Some(val)),
                                 Procedure::Streaming { closure } => {
-                                    (closure)(Box::new(yielder), args)?;
+                                    (closure)(Box::new(yielder), &message.chunks[0])?;
                                     Ok(None)
                                 }
                             };
@@ -365,7 +448,13 @@ macro_rules! define_interface {
             pub $($async)? fn push(&self) -> IpfiInteger {
                 let new_id = self.message_id_queue.get();
                 self.messages
-                    .insert(new_id, (Vec::new(), 0, CompleteLock::new()));
+                    .insert(new_id, MessageBuffer {
+                        // Always allocate one chunk first
+                        chunks: vec![ Vec::new() ],
+                        complete_lock: CompleteLock::new(),
+                        // No sender is created until the user asks for it explicitly
+                        sender: None,
+                    });
 
                 // If anyone was waiting for this buffer to exist, it now does!
                 if let Some(lock) = self.creation_locks.get_mut(&new_id) {
@@ -389,14 +478,15 @@ macro_rules! define_interface {
             /// careful in how it handles these errors.
             pub $($async)? fn send(&self, datum: i8, message_id: IpfiInteger) -> Result<bool, Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
-                    let (message, _chunk_count, complete_lock) = m.value_mut();
-                    if complete_lock.completed()$(.$await)? {
+                    let message = m.value_mut();
+                    if message.complete_lock.completed()$(.$await)? {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else if datum < 0 {
-                        complete_lock.mark_complete()$(.$await)?;
+                        message.complete_lock.mark_complete()$(.$await)?;
                         Ok(false)
                     } else {
-                        message.push(datum as u8);
+                        // There will always be at least one chunk
+                        message.chunks.last_mut().unwrap().push(datum as u8);
                         Ok(true)
                     }
                 } else {
@@ -404,15 +494,16 @@ macro_rules! define_interface {
                 }
             }
             /// Sends many bytes through to the interface. When you have many bytes instead of just one at a time, this
-            /// method should be preferred. Note that this method will not allow the termination of a message, and that should
-            /// be handled separately.
+            /// method should be preferred. Note that this method will not allow the termination of a message or chunk,
+            /// and that should be handled separately.
             pub $($async)? fn send_many(&self, data: &[u8], message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
-                    let (message, _chunk_count, complete_lock) = m.value_mut();
-                    if complete_lock.completed()$(.$await)? {
+                    let message = m.value_mut();
+                    if message.complete_lock.completed()$(.$await)? {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
-                        message.extend(data);
+                        // There will always be at least one chunk
+                        message.chunks.last_mut().unwrap().extend(data);
                         Ok(())
                     }
                 } else {
@@ -420,49 +511,134 @@ macro_rules! define_interface {
                 }
             }
             /// Explicitly terminates the message with the given index. This will return an error if the message
-            /// has already been terminated or if it was out-of-bounds. This will *not* increment the number of chunks,
-            /// which should be done separately (before calling this function!) if streaming deserialisation might be
-            /// used. If not, the chunk count can be left alone.
+            /// has already been terminated or if it was out-of-bounds. This will not change anything about the
+            /// chunk layout of the message, and, for the final chunk, this should be called *instead of* terminating
+            /// the chunk, otherwise an additional, empty chunk will be created. If there is a chunk receiver registered,
+            /// this will send the final chunk through it.
+            ///
+            /// For messages with real-time chunk receivers registered, this will drop the only sender, thus ending
+            /// the channel.
             pub $($async)? fn terminate_message(&self, message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
-                    let (_message, _chunk_count, complete_lock) = m.value_mut();
-                    if complete_lock.completed()$(.$await)? {
+                    let message = m.value_mut();
+                    if message.complete_lock.completed()$(.$await)? {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
-                        complete_lock.mark_complete()$(.$await)?;
+                        message.complete_lock.mark_complete()$(.$await)?;
+                        if let Some(sender) = &message.sender {
+                            // We can guarantee that the referenced message will exist, because there will always be
+                            // at least one chunk
+                            let completed_chunk = message.chunks.remove(message.chunks.len() - 1);
+                            // If sending the chunk fails (receiver dropped), add it back
+                            // We know that this will be `Some(sender) internally, because it will only
+                            // be set to `None` after termination, which we've checked for
+                            let mut sender = sender.lock().unwrap();
+                            match sender.as_ref().unwrap().send(completed_chunk) {
+                                // We need to make sure there's at least one chunk to uphold internal invariants
+                                Ok(_) => message.chunks.push(Vec::new()),
+                                Err(err) => {
+                                    message.chunks.push(err.0)
+                                }
+                            };
+                            // Now drop the sender (no-one will access it after this, because we've marked the
+                            // message as completed), but maintain the information that there once was one (as
+                            // `Some(Mutex(None))`)
+                            *sender = None;
+                        }
                         Ok(())
                     }
                 } else {
                     Err(Error::OutOfBounds { index: message_id })
                 }
             }
-            /// Increment the number of chunks associated with the given message buffer. This will fail if the message
-            /// has already been terminated (meaning you must update the chunk count before terminating a message,
-            /// if you care about chunk counts).
-            pub $($async)? fn increment_chunk_count(&self, message_id: IpfiInteger) -> Result<(), Error> {
+            /// Terminates the current chunk in the given message buffer, creating a new chunk to accept further
+            /// data. This should not be called to terminate the final chunk, you should use `.terminate_message()`
+            /// for that to properly seal the buffer. If there is a real-time chunk receiver registered for this
+            /// message buffer, this method will take the terminated chunk and send it directly to that receiver,
+            /// thereby removing it from the message buffer. This kind of potential "corruption" is signalled by
+            /// the `Some(_)` value of `message.sender`.
+            ///
+            /// This will fail if the message itself has been terminated.
+            pub $($async)? fn terminate_chunk(&self, message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
-                    let (_message, chunk_count, complete_lock) = m.value_mut();
-                    if complete_lock.completed()$(.$await)? {
+                    // Borrowing mutably here ensures we can't deadlock on the sender `Mutex`
+                    let message = m.value_mut();
+                    if message.complete_lock.completed()$(.$await)? {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
-                        *chunk_count += 1;
+                        // We'll always append further data to the last chunk
+                        if let Some(sender) = &message.sender {
+                            // We can guarantee that the referenced message will exist, because there will always be
+                            // at least one chunk
+                            let completed_chunk = message.chunks.remove(message.chunks.len() - 1);
+                            // If sending the chunk fails (receiver dropped), add it back
+                            // We know that this will be `Some(sender) internally, because it will only
+                            // be set to `None` after termination, which we've checked for
+                            match sender.lock().unwrap().as_ref().unwrap().send(completed_chunk) {
+                                Ok(_) => (),
+                                Err(err) => {
+                                    message.chunks.push(err.0)
+                                }
+                            };
+                        }
+                        // We might have removed the only chunk, but regardless, we're adding a new one (always-one-
+                        // chunk invariant preserved)
+                        message.chunks.push(Vec::new());
                         Ok(())
                     }
                 } else {
                     Err(Error::OutOfBounds { index: message_id })
                 }
+            }
+            /// Creates a sender/receiver pair that can be used to accessing the chunks in a message in real-time. Once
+            /// this method is called, any future `.get_chunks()` calls are guaranteed to return `None`, as they cannot
+            /// provide useful information. Other `.get()`-type calls will yield no information, because chunks will be
+            /// streamed out in real-time, and thereby removed from the message buffer. Essentially, once this is called,
+            /// all bytes are piped out to the created receiver, rather than being saved.
+            ///
+            /// If the provided message buffer does not yet exist, this will wait for it to before creating the sender/receiver
+            /// pair. This is done to avoid disrupting any existing creation locks that might be held on the message.
+            pub $($async)? fn get_chunk_stream(&self, message_id: IpfiInteger) -> ChunkReceiver {
+                self.wait_for_message_creation(message_id)$(.$await)?;
+                // This is guaranteed to exist, but it almost certainly won't be complete
+                let mut message = self.messages.get_mut(&message_id).unwrap();
+                // First, create a raw bytes sender/receiver pair, which we can wrap for deserialisation
+                // Types are dependent on import context of this macro
+                let (tx, rx) = channel::<Vec<u8>>();
+                message.sender = Some(Mutex::new(Some(tx)));
+
+                ChunkReceiver::new(rx)
+            }
+            /// Returns whether or not the given message is chunked. This will wait until the message has been completed
+            /// before returning anything. Note that whether or not a message is chunked is purely determined by whether
+            /// or not the sender terminates a chunk explicitly (thereby creating a second chunk, etc.).
+            pub $($async)? fn is_chunked(&self, message_id: IpfiInteger) -> bool {
+                let message_ref = self.wait_for_message(message_id)$(.$await)?;
+                message_ref.chunks.len() > 1
+            }
+            /// Returns whether or not the given message has a real-time chunk receiver registered on it. If so, this likely
+            /// indicates that the message buffer will be incomplete and should not be fetched directly. See [`Interface`] for
+            /// further details on chunking. This method will wait until the given message has been completed.
+            pub $($async)? fn has_stream(&self, message_id: IpfiInteger) -> bool {
+                let message_ref = self.wait_for_message(message_id)$(.$await)?;
+                message_ref.sender.is_some()
             }
             /// Gets an object of the given type from the given message buffer index of the interface. This will block
             /// waiting for the given message buffer to be (1) created and (2) marked as complete. Depending on the
             /// caller's behaviour, this may block forever if they never complete the message.
             ///
+            /// For messages with multiple chunks, this will only pay attention to the first chunk. For chunked messages,
+            /// you should prefer `.get_chunks()`, which will deserialise as many chunks as are available. To determine whether
+            /// or not a message has been chunked, you can use `.is_chunked()`.
+            ///
             /// Note that this method will extract the underlying message from the given buffer index, leaving it
             /// available for future messages or procedure call metadata. This means that requesting the same message
             /// index may yield completely different data.
             #[cfg(feature = "serde")]
-            pub $($async)? fn get<T: DeserializeOwned>(&self, message: IpfiInteger) -> Result<T, Error> {
-                let message = self.get_raw(message)$(.$await)?;
-                let decoded = rmp_serde::decode::from_slice(&message)?;
+            pub $($async)? fn get<T: DeserializeOwned>(&self, message_id: IpfiInteger) -> Result<T, Error> {
+                let chunks = self.get_raw(message_id)$(.$await)?;
+                // There will always be at least one chunk
+                let decoded = rmp_serde::decode::from_slice(&chunks[0])?;
                 Ok(decoded)
             }
             /// Same as `.get()`, except this is designed to be used for procedures that are known to stream their output
@@ -472,32 +648,54 @@ macro_rules! define_interface {
             ///
             /// Note that, if used on any other type of message, this will still work, it will just produce a vector of length 1
             /// (as there was only one chunk involved).
+            ///
+            /// Bear in mind that, if `.get_chunk_stream()` has been previously called on this message, then this will produce
+            /// no data (as the chunks will have been streamed to the receiver in real-time). In that case, `None` will be returned
+            /// for clarity.
             #[cfg(feature = "serde")]
-            pub $($async)? fn get_chunks<T: DeserializeOwned>(&self, message: IpfiInteger) -> Result<Vec<T>, Error> {
-                let (message, chunk_count) = self.get_raw_with_chunk_count(message)$(.$await)?;
-                let mut bytes = Vec::new();
-                // XXX: It is theoretically possible for this to fail if we pass `u32::MAX` chunks, somehow...
-                rmp::encode::write_array_len(&mut bytes, chunk_count.into())
-                            .map_err(|_| Error::WriteLenMarkerFailed)?;
-                bytes.extend(message);
-                let decoded = rmp_serde::decode::from_slice(&bytes)?;
-                Ok(decoded)
+            pub $($async)? fn get_chunks<T: DeserializeOwned>(&self, message_id: IpfiInteger) -> Result<Option<Vec<T>>, Error> {
+                // Wait for the message and check if it has a sender attached: if so, this method would yield
+                // no useful information because everything is streamed in real-time
+                let message_ref = self.wait_for_message(message_id)$(.$await)?;
+                if message_ref.sender.is_some() {
+                    return Ok(None);
+                }
+                // We've already manually waited on the message, so we can safely directly pop it out
+                let MessageBuffer { chunks, .. } = self.pop(message_id).unwrap();
+
+                let mut decoded_chunks = Vec::new();
+                for chunk in chunks {
+                    let decoded = rmp_serde::decode::from_slice(&chunk)?;
+                    decoded_chunks.push(decoded);
+                }
+
+                Ok(Some(decoded_chunks))
             }
-            /// Same as `.get()`, but gets the raw byte array instead. Note that this will copy the underlying bytes to return
-            /// them outside the thread-lock.
+            /// Same as `.get()`, but gets the raw byte array instead. This will return the chunks in which
+            /// the message was sent, which, for the vast majority of messages, will be only one. See
+            /// [`Interface`] to learn more about chunks.
             ///
             /// This will block until the message with the given identifier has been created and completed.
             ///
             /// Note that this method will extract the underlying message from the given buffer index, leaving it
             /// available for future messages or procedure call metadata. This means that requesting the same message
-            /// index may yield completely different data.
-            pub $($async)? fn get_raw(&self, message_id: IpfiInteger) -> Vec<u8> {
-                let (message, _chunk_count) = self.get_raw_with_chunk_count(message_id)$(.$await)?;
-                message
+            /// index may yield completely different data. It is typically useful to use this method through some higher-level
+            /// structure, such as a [`crate::CallHandle`].
+            pub $($async)? fn get_raw(&self, message_id: IpfiInteger) -> Vec<Vec<u8>> {
+                // Wait for the creation and completion locks, but don't retain any of the information
+                // we get
+                let _ = self.wait_for_message(message_id)$(.$await)?;
+
+                // This definitely exists if we got here (and it logically has to).
+                // Note that this will also prepare the message identifier for reuse.
+                // This is safe to call because we only hold a clone of the completion
+                // lock.
+                let message = self.pop(message_id).unwrap();
+                message.chunks
             }
-            /// Same as `.get_raw()`, but this also includes the number of defined chunks this message came in. Note
-            /// that the number of chunks is administered through a separate definition process to the end of a message.
-            pub $($async)? fn get_raw_with_chunk_count(&self, message_id: IpfiInteger) -> (Vec<u8>, IpfiInteger) {
+            /// Waits until the given message has been created and completed, then returns the information about it as
+            /// a reference. This returns an abstraction over a lock, which should be dropped as soon as possible.
+            $($async)? fn wait_for_message(&self, message_id: IpfiInteger) -> Ref<'_, IpfiInteger, MessageBuffer, BuildNoHashHasher<IpfiInteger>> {
                 // We need two completion locks to be ready before we're ready: the first is
                 // a creation lock on the message index, and the second is a lock on its
                 // actual completion. We'll start by creating a new completion lock if one
@@ -507,20 +705,7 @@ macro_rules! define_interface {
                     let message = if let Some(message) = self.messages.get(&message_id) {
                         message
                     } else {
-                        let lock = if let Some(lock) = self.creation_locks.get(&message_id) {
-                            lock.clone()
-                        } else {
-                            // This is the only time at which we create a new creation lock
-                            let lock = CompleteLock::new();
-                            self.creation_locks.insert(message_id, lock.clone());
-                            lock
-                        };
-
-                        lock.wait_for_completion()$(.$await)?;
-                        // Now delete that lock to free up some space
-                        // Note that our read-only creation locks instance will definitely have been dropped
-                        // by this point
-                        self.creation_locks.remove(&message_id);
+                        self.wait_for_message_creation(message_id)$(.$await)?;
 
                         // We can guarantee that this will exist now
                         self.messages
@@ -528,17 +713,33 @@ macro_rules! define_interface {
                             .expect("complete lock should signal that message exists")
                     };
                     // Cheap clone
-                    message.2.clone()
+                    message.complete_lock.clone()
                 };
 
                 message_lock.wait_for_completion()$(.$await)?;
+                self.messages.get(&message_id).unwrap()
+            }
+            /// Waits until the given message has been created. This will return as soon as it has been, without regard
+            /// for whether or not it has been completed.
+            $($async)? fn wait_for_message_creation(&self, message_id: IpfiInteger) {
+                // If the message buffer is already present, return immediately, otherwise register a creation
+                // lock and wait for it
+                if self.messages.get(&message_id).is_none() {
+                    let lock = if let Some(lock) = self.creation_locks.get(&message_id) {
+                        lock.clone()
+                    } else {
+                        // This is the only time at which we create a new creation lock
+                        let lock = CompleteLock::new();
+                        self.creation_locks.insert(message_id, lock.clone());
+                        lock
+                    };
 
-                // This definitely exists if we got here (and it logically has to).
-                // Note that this will also prepare the message identifier for reuse.
-                // This is safe to call because we only hold a clone of the completion
-                // lock.
-                let (message, chunk_count, _complete_lock) = self.pop(message_id).unwrap();
-                (message, chunk_count)
+                    lock.wait_for_completion()$(.$await)?;
+                    // Now delete that lock to free up some space
+                    // Note that our read-only creation locks instance will definitely have been dropped
+                    // by this point
+                    self.creation_locks.remove(&message_id);
+                };
             }
         }
     };
@@ -640,7 +841,7 @@ macro_rules! define_interface_tests {
             // We haven't fetched, so this should increment
             assert_eq!(interface.push()$(.$await)?, 1);
             let msg = interface.get_raw(0)$(.$await)?;
-            assert_eq!(msg, [42]);
+            assert_eq!(msg[0], [42]);
             // But now we have fetched from the ID, so it should be reused
             assert_eq!(interface.push()$(.$await)?, 0);
         }
@@ -674,7 +875,8 @@ macro_rules! define_interface_tests {
             let id = interface.push()$(.$await)?;
             assert!(interface.terminate_message(id)$(.$await)?.is_ok());
             let msg = interface.get_raw(id)$(.$await)?;
-            assert_eq!(msg, []);
+            assert_eq!(msg[0], []);
         }
+        // TODO Chunk tests
     };
 }

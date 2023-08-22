@@ -67,10 +67,15 @@ fn main() {
     let magic_number: u32 = magic_number_handle.wait().unwrap();
     // This will get the streamed data directly, and will block until *all* of it is available (so it's being streamed
     // in, but not streamed out)
-    let streamed_data: Vec<String> = stream_handle.wait_chunks().unwrap();
+    // We haven't listened to it in real-time, so we know there will be data there
+    let mut data_rx = stream_handle.wait_chunk_stream();
 
     println!("Magic number was {}!", magic_number);
-    println!("Streamed data was {:?}", streamed_data);
+
+    while let Some(msg) = data_rx.recv::<String>() {
+        let msg = msg.unwrap();
+        println!("Streaming data: {}.", msg);
+    }
 
     // Wasm will automatically finish when it's done, but the multi-threaded non-Wasm module will hang around
     // waiting for further messages, so we'll explicitly signal a termination
