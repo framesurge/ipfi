@@ -3,6 +3,20 @@ use tokio::sync::mpsc::{
 };
 
 crate::define_interface!(async, await);
+impl ChunkReceiver {
+    async fn recv_timeout(&mut self, millis: usize) -> Option<Option<Vec<u8>>> {
+        // Run the receiver call, but in a clear timeout (this mimics the `std` behaviour without needing a `recv_timeout()` method)
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(millis as u64),
+            self.rx.recv(),
+        )
+        .await
+        {
+            Ok(val) => Some(val),
+            Err(_) => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -43,7 +57,7 @@ mod tests {
         assert!(!msg.is_finished());
         interface.terminate_message(id).await.unwrap();
 
-        let msg = msg.await.unwrap();
+        let msg = msg.await.unwrap().unwrap();
         assert_eq!(msg[0], [42]);
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -69,7 +83,7 @@ mod tests {
         assert!(!msg.is_finished());
         interface.terminate_message(0).await.unwrap();
 
-        let msg = msg.await.unwrap();
+        let msg = msg.await.unwrap().unwrap();
         assert_eq!(msg[0], [42]);
     }
 }

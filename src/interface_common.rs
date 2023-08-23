@@ -47,7 +47,7 @@ macro_rules! define_interface {
         #[cfg(feature = "serde")]
         use $crate::procedure_args::Tuple;
         use $crate::roi_queue::RoiQueue;
-        use $crate::{CallIndex, Terminator, IpfiInteger, ProcedureIndex, WireId};
+        use $crate::{CallIndex, Terminator, IpfiInteger, ProcedureIndex, WireId, CompleteLockState};
         use dashmap::{DashMap, mapref::one::Ref};
         use fxhash::FxBuildHasher;
         use nohash_hasher::BuildNoHashHasher;
@@ -90,31 +90,93 @@ macro_rules! define_interface {
         pub struct ChunkReceiver {
             // The type of this will depend on the import context in which this macro is used
             rx: Receiver<Vec<u8>>,
+            /// The completion lock on the message we're receiving chunks for. This allows checking for poisons
+            /// regularly.
+            complete_lock: CompleteLock,
+            /// The message identifier this chunk receiver tracks.
+            // This is only used for preparing errors
+            message_id: IpfiInteger,
+            /// How long we should wait between receiver calls.
+            timeout_millis: usize,
         }
         impl ChunkReceiver {
-            fn new(rx: Receiver<Vec<u8>>) -> Self {
-                Self { rx }
+            fn new(rx: Receiver<Vec<u8>>, message_id: IpfiInteger, complete_lock: CompleteLock) -> Self {
+                Self { rx, complete_lock, message_id, timeout_millis: 10 }
+            }
+            /// Sets the maximum number of milliseconds that this receiver could potentially wait for on a
+            /// call to `.recv()`/`.recv_raw()` if the underlying wire terminates.
+            ///
+            /// The default value is 10 milliseconds: higher values will mean more time between a wire termination and
+            /// an error being returned, and lower values will mean more resource-intensive waiting for values when
+            /// termination does not occur.
+            pub fn termination_timeout_millis(mut self, millis: usize) -> Self {
+                self.timeout_millis = millis;
+                self
             }
             /// Waits to receive the raw bytes of the next chunk.
-            pub $($async)? fn recv_raw(&mut self) -> Option<Vec<u8>> {
-                // The Tokio channels use `Option`, while the `std` ones use `Result`, hence this
-                // wizardry
-                self.rx.recv()$(.$await.ok_or(()))?.ok()
+            ///
+            /// If this finds that the underlying message's completion lock has been poisoned (which would typically
+            /// happen if the wire had been terminated), then it will return an error. Note that this does not necessarily
+            /// mean that it cannot be polled again, as there may still be a chunk or two left to come through due
+            /// to atomic operations and ordering. If the message is later completed, any poisons would be removed and
+            /// this would calmly return `Ok(None)`.
+            ///
+            /// In order to continually check the completion lock to ensure it hasn't been poisoned, this implements
+            /// receiving through a timeout. If the timeout is reached, the completion lock is checked again, and then
+            /// the timeout restarts. This means this performs more resource-intensive waiting than a traditional receiver
+            /// call would, although this should not be material for most applications. (The default timeout is 10
+            /// milliseconds, which is thus the maximum time this would wait for after a wire had been terminated.)
+            pub $($async)? fn recv_raw(&mut self) -> Result<Option<Vec<u8>>, Error> {
+                loop {
+                    if self.complete_lock.state()$(.$await)? == CompleteLockState::Poisoned {
+                        // The lock is poisoned, but still check if there's anything the receiver can give us
+                        return match self.rx.try_recv() {
+                            Ok(bytes) => Ok(Some(bytes)),
+                            // `TryRecvError` will be different depending on the import context in which this macro is used
+                            //
+                            // Either the channel is empty, and we probably won't see any messages every again, or it *appears*
+                            // closed. It's important that we don't accept that, however, because that would occur from simply
+                            // dropping the message buffer from the interface, which could happen in a sweep for old wire messages.
+                            // As such, we have no reliable indicator of completion beyond the completion lock, so we'll
+                            // defer to that. If we had really terminated gracefully, the completion lock would have been
+                            // updated.
+                            Err(_) => Err(Error::LockPoisoned { index: self.message_id }),
+                        }
+                    } else {
+                        // let res = self.rx.recv()$(.$await.ok_or(()))?.ok();
+                        // This method is implemented in async/blocking-specific ways: it blocks waiting for a value, then
+                        // times out after some user-specified number of milliseconds, returning `None` if it couldn't get
+                        // anything in that time (that way, we can re-check the completion lock for poisoning regularly)
+                        match self.recv_timeout(self.timeout_millis)$(.$await)? {
+                            // Timed out, check for poisons and start again
+                            None => continue,
+                            // Got something and we weren't poisoned when we last checked!
+                            Some(val) => return Ok(val),
+                        }
+                    }
+                }
             }
             /// Waits to receive the next chunk, deserialising it into the given type. Generally, all chunks will be
             /// deserialised into the same type, however it is perfeclty possible, if there is a known type layout,
             /// to deserialise one chunk as one type and a different one as another, although this is not recommended
             /// except in highly deterministic systems.
+            ///
+            /// The convoluted return type of this function indicates the following:
+            ///     1. There could be a poisoned lock involved when we poll, so there might be an error with polling,
+            ///     2. But if there isn't, the sender might have been dropped (i.e. message is complete),
+            ///     3. Even if there is a chunk, we might fail to deserialise it,
+            ///     4. If all that works, you get `T`.
             #[cfg(feature = "serde")]
-            pub $($async)? fn recv<T: DeserializeOwned>(&mut self) -> Option<Result<T, Error>> {
-                if let Ok(bytes) = self.rx.recv()$(.$await.ok_or(()))? {
+            pub $($async)? fn recv<T: DeserializeOwned>(&mut self) -> Result<Option<Result<T, Error>>, Error> {
+                let rx_option = self.recv_raw()$(.$await)??;
+                if let Some(bytes) = rx_option {
                     let decoded = match rmp_serde::decode::from_slice(&bytes) {
                         Ok(decoded) => decoded,
-                        Err(err) => return Some(Err(err.into()))
+                        Err(err) => return Ok(Some(Err(err.into())))
                     };
-                    Some(Ok(decoded))
+                    Ok(Some(Ok(decoded)))
                 } else {
-                    None
+                    Ok(None)
                 }
             }
         }
@@ -221,7 +283,6 @@ macro_rules! define_interface {
                     // This will deal with recycling the ID appropriately
                     self.pop(message_id);
                 }
-
             }
             /// Adds the given function as a procedure on this interface, which will allow other programs interacting with
             /// this one to execute it. Critically, no validation of intent or origin is requires to remotely execute procedures
@@ -401,24 +462,28 @@ macro_rules! define_interface {
                 if let Some(procedure) = self.procedures.get(&procedure_idx) {
                     if let Some(m) = self.messages.get(&args_buf_idx) {
                         let message = m.value();
-                        if message.complete_lock.completed()$(.$await)? {
-                            // The length marker will be inserted by the internal wrapper closure
-                            let ret = match &*procedure {
-                                // Note that we always know there will be at least one chunk, so this can
-                                // never panic (and procedure calls are never chunked)
-                                Procedure::Standard { closure } => (closure)(&message.chunks[0]).map(|val| Some(val)),
-                                Procedure::Streaming { closure } => {
-                                    (closure)(Box::new(yielder), &message.chunks[0])?;
-                                    Ok(None)
-                                }
-                            };
-                            // Success, relinquish this message buffer
-                            // To do that though, we have to drop anything referencing the map
-                            drop(m);
-                            self.pop(args_buf_idx);
-                            ret
-                        } else {
-                            Err(Error::CallBufferIncomplete {
+                        match message.complete_lock.state()$(.$await)? {
+                            CompleteLockState::Complete => {
+                                // The length marker will be inserted by the internal wrapper closure
+                                let ret = match &*procedure {
+                                    // Note that we always know there will be at least one chunk, so this can
+                                    // never panic (and procedure calls are never chunked)
+                                    Procedure::Standard { closure } => (closure)(&message.chunks[0]).map(|val| Some(val)),
+                                    Procedure::Streaming { closure } => {
+                                        (closure)(Box::new(yielder), &message.chunks[0])?;
+                                        Ok(None)
+                                    }
+                                };
+                                // Success, relinquish this message buffer
+                                // To do that though, we have to drop anything referencing the map
+                                drop(m);
+                                self.pop(args_buf_idx);
+                                ret
+                            },
+                            CompleteLockState::Incomplete => Err(Error::CallBufferIncomplete {
+                                index: args_buf_idx,
+                            }),
+                            CompleteLockState::Poisoned => Err(Error::CallBufferPoisoned {
                                 index: args_buf_idx,
                             })
                         }
@@ -490,10 +555,15 @@ macro_rules! define_interface {
             /// This will fail if the message with the given identifier had already been completed, or it did not exist.
             /// Either of these cases can be trivially caused by a malicious client, and the caller should therefore be
             /// careful in how it handles these errors.
+            ///
+            /// Notably, this will still append to a poisoned message buffer (because a poisoned completion lock merely
+            /// indicates that it is unlikely that the message will ever be completed, it doesn't hurt to try). If this
+            /// call would complete a poisoned buffer, its state will be changed to completed.
             pub $($async)? fn send(&self, datum: i8, message_id: IpfiInteger) -> Result<bool, Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
                     let message = m.value_mut();
-                    if message.complete_lock.completed()$(.$await)? {
+                    // Only fail on completions, we'll allow poisons
+                    if message.complete_lock.state()$(.$await)? == CompleteLockState::Complete {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else if datum < 0 {
                         message.complete_lock.mark_complete()$(.$await)?;
@@ -510,10 +580,13 @@ macro_rules! define_interface {
             /// Sends many bytes through to the interface. When you have many bytes instead of just one at a time, this
             /// method should be preferred. Note that this method will not allow the termination of a message or chunk,
             /// and that should be handled separately.
+            ///
+            /// Like `.send()`, this will ignore poisoned message buffers, and will try to complete them if possible
+            /// (without changing their state).
             pub $($async)? fn send_many(&self, data: &[u8], message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
                     let message = m.value_mut();
-                    if message.complete_lock.completed()$(.$await)? {
+                    if message.complete_lock.state()$(.$await)? == CompleteLockState::Complete {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
                         // There will always be at least one chunk
@@ -531,11 +604,14 @@ macro_rules! define_interface {
             /// this will send the final chunk through it (only if that chunk hasn't been sent before).
             ///
             /// For messages with real-time chunk receivers registered, this will drop the only sender, thus ending
-            /// the channel.
+            /// the channel, and it will pop the message, allowing the index to be reused.
+            ///
+            /// If this terminates a message with a poisoned completion lock, it will change the lock's state from
+            /// poisoned to completed.
             pub $($async)? fn terminate_message(&self, message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
                     let message = m.value_mut();
-                    if message.complete_lock.completed()$(.$await)? {
+                    if message.complete_lock.state()$(.$await)? == CompleteLockState::Complete {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
                         message.complete_lock.mark_complete()$(.$await)?;
@@ -548,16 +624,23 @@ macro_rules! define_interface {
                             // be set to `None` after termination, which we've checked for
                             let mut sender = sender.lock().unwrap();
                             match sender.as_ref().unwrap().send(completed_chunk) {
-                                // We need to make sure there's at least one chunk to uphold internal invariants
-                                Ok(_) => message.chunks.push(Vec::new()),
+                                Ok(_) => {
+                                    // We need to make sure there's at least one chunk to uphold internal invariants
+                                    message.chunks.push(Vec::new());
+                                    // And now drop the entire message for identifier recycling (no-one is going to
+                                    // `.get()` it afterward)
+                                    drop(sender);
+                                    drop(m);
+                                    self.pop(message_id);
+                                },
                                 Err(err) => {
-                                    message.chunks.push(err.0)
+                                    message.chunks.push(err.0);
+                                    // Now drop the sender (no-one will access it after this, because we've marked the
+                                    // message as completed), but maintain the information that there once was one (as
+                                    // `Some(Mutex(None))`)
+                                    *sender = None;
                                 }
                             };
-                            // Now drop the sender (no-one will access it after this, because we've marked the
-                            // message as completed), but maintain the information that there once was one (as
-                            // `Some(Mutex(None))`)
-                            *sender = None;
                         }
                         Ok(())
                     }
@@ -572,12 +655,13 @@ macro_rules! define_interface {
             /// thereby removing it from the message buffer. This kind of potential "corruption" is signalled by
             /// the `Some(_)` value of `message.sender`.
             ///
-            /// This will fail if the message itself has been terminated.
+            /// This will fail if the message itself has been terminated, but will succeed if the message has a poisoned
+            /// completion lock.
             pub $($async)? fn terminate_chunk(&self, message_id: IpfiInteger) -> Result<(), Error> {
                 if let Some(mut m) = self.messages.get_mut(&message_id) {
                     // Borrowing mutably here ensures we can't deadlock on the sender `Mutex`
                     let message = m.value_mut();
-                    if message.complete_lock.completed()$(.$await)? {
+                    if message.complete_lock.state()$(.$await)? == CompleteLockState::Complete {
                         Err(Error::AlreadyCompleted { index: message_id })
                     } else {
                         // We'll always append further data to the last chunk
@@ -612,8 +696,8 @@ macro_rules! define_interface {
             ///
             /// If the provided message buffer does not yet exist, this will wait for it to before creating the sender/receiver
             /// pair. This is done to avoid disrupting any existing creation locks that might be held on the message.
-            pub $($async)? fn get_chunk_stream(&self, message_id: IpfiInteger) -> ChunkReceiver {
-                self.wait_for_message_creation(message_id)$(.$await)?;
+            pub $($async)? fn get_chunk_stream(&self, message_id: IpfiInteger) -> Result<ChunkReceiver, Error> {
+                self.wait_for_message_creation(message_id)$(.$await)??;
                 // This is guaranteed to exist, but it almost certainly won't be complete
                 let mut message = self.messages.get_mut(&message_id).unwrap();
                 // First, create a raw bytes sender/receiver pair, which we can wrap for deserialisation
@@ -621,21 +705,21 @@ macro_rules! define_interface {
                 let (tx, rx) = channel::<Vec<u8>>();
                 message.sender = Some(Mutex::new(Some(tx)));
 
-                ChunkReceiver::new(rx)
+                Ok(ChunkReceiver::new(rx, message_id, message.complete_lock.clone()))
             }
             /// Returns whether or not the given message is chunked. This will wait until the message has been completed
             /// before returning anything. Note that whether or not a message is chunked is purely determined by whether
             /// or not the sender terminates a chunk explicitly (thereby creating a second chunk, etc.).
-            pub $($async)? fn is_chunked(&self, message_id: IpfiInteger) -> bool {
-                let message_ref = self.wait_for_message(message_id)$(.$await)?;
-                message_ref.chunks.len() > 1
+            pub $($async)? fn is_chunked(&self, message_id: IpfiInteger) -> Result<bool, Error> {
+                let message_ref = self.wait_for_message(message_id)$(.$await)??;
+                Ok(message_ref.chunks.len() > 1)
             }
             /// Returns whether or not the given message has a real-time chunk receiver registered on it. If so, this likely
             /// indicates that the message buffer will be incomplete and should not be fetched directly. See [`Interface`] for
             /// further details on chunking. This method will wait until the given message has been completed.
-            pub $($async)? fn has_stream(&self, message_id: IpfiInteger) -> bool {
-                let message_ref = self.wait_for_message(message_id)$(.$await)?;
-                message_ref.sender.is_some()
+            pub $($async)? fn has_stream(&self, message_id: IpfiInteger) -> Result<bool, Error> {
+                let message_ref = self.wait_for_message(message_id)$(.$await)??;
+                Ok(message_ref.sender.is_some())
             }
             /// Gets an object of the given type from the given message buffer index of the interface. This will block
             /// waiting for the given message buffer to be (1) created and (2) marked as complete. Depending on the
@@ -650,7 +734,7 @@ macro_rules! define_interface {
             /// index may yield completely different data.
             #[cfg(feature = "serde")]
             pub $($async)? fn get<T: DeserializeOwned>(&self, message_id: IpfiInteger) -> Result<T, Error> {
-                let chunks = self.get_raw(message_id)$(.$await)?;
+                let chunks = self.get_raw(message_id)$(.$await)??;
                 // There will always be at least one chunk
                 let decoded = rmp_serde::decode::from_slice(&chunks[0])?;
                 Ok(decoded)
@@ -670,7 +754,7 @@ macro_rules! define_interface {
             pub $($async)? fn get_chunks<T: DeserializeOwned>(&self, message_id: IpfiInteger) -> Result<Option<Vec<T>>, Error> {
                 // Wait for the message and check if it has a sender attached: if so, this method would yield
                 // no useful information because everything is streamed in real-time
-                let message_ref = self.wait_for_message(message_id)$(.$await)?;
+                let message_ref = self.wait_for_message(message_id)$(.$await)??;
                 if message_ref.sender.is_some() {
                     return Ok(None);
                 }
@@ -696,21 +780,23 @@ macro_rules! define_interface {
             /// available for future messages or procedure call metadata. This means that requesting the same message
             /// index may yield completely different data. It is typically useful to use this method through some higher-level
             /// structure, such as a [`crate::CallHandle`].
-            pub $($async)? fn get_raw(&self, message_id: IpfiInteger) -> Vec<Vec<u8>> {
+            pub $($async)? fn get_raw(&self, message_id: IpfiInteger) -> Result<Vec<Vec<u8>>, Error> {
                 // Wait for the creation and completion locks, but don't retain any of the information
                 // we get
-                let _ = self.wait_for_message(message_id)$(.$await)?;
+                let _ = self.wait_for_message(message_id)$(.$await)??;
 
                 // This definitely exists if we got here (and it logically has to).
                 // Note that this will also prepare the message identifier for reuse.
                 // This is safe to call because we only hold a clone of the completion
                 // lock.
                 let message = self.pop(message_id).unwrap();
-                message.chunks
+                Ok(message.chunks)
             }
             /// Waits until the given message has been created and completed, then returns the information about it as
             /// a reference. This returns an abstraction over a lock, which should be dropped as soon as possible.
-            $($async)? fn wait_for_message(&self, message_id: IpfiInteger) -> Ref<'_, IpfiInteger, MessageBuffer, BuildNoHashHasher<IpfiInteger>> {
+            ///
+            /// If this finds any of the underlying completion locks to be poisoned, it will fail.
+            $($async)? fn wait_for_message(&self, message_id: IpfiInteger) -> Result<Ref<'_, IpfiInteger, MessageBuffer, BuildNoHashHasher<IpfiInteger>>, Error> {
                 // We need two completion locks to be ready before we're ready: the first is
                 // a creation lock on the message index, and the second is a lock on its
                 // actual completion. We'll start by creating a new completion lock if one
@@ -720,7 +806,7 @@ macro_rules! define_interface {
                     let message = if let Some(message) = self.messages.get(&message_id) {
                         message
                     } else {
-                        self.wait_for_message_creation(message_id)$(.$await)?;
+                        self.wait_for_message_creation(message_id)$(.$await)??;
 
                         // We can guarantee that this will exist now
                         self.messages
@@ -731,14 +817,29 @@ macro_rules! define_interface {
                     message.complete_lock.clone()
                 };
 
-                message_lock.wait_for_completion()$(.$await)?;
-                self.messages.get(&message_id).unwrap()
+                let state = message_lock.wait_for_completion()$(.$await)?;
+                if state == CompleteLockState::Poisoned {
+                    return Err(Error::LockPoisoned { index: message_id })
+                }
+                Ok(self.messages.get(&message_id).unwrap())
             }
             /// Waits until the given message has been created. This will return as soon as it has been, without regard
             /// for whether or not it has been completed.
-            $($async)? fn wait_for_message_creation(&self, message_id: IpfiInteger) {
+            ///
+            /// If this finds a poisoned creation lock, it will fail. However, if the message buffer exists already,
+            /// this will succeed *even if* there is a poisoned creation lock (this almost certainly indicates
+            /// that the message in this buffer is not the one you were expecting, but that can be handled by pre-allocating
+            /// message buffers for later filling and reading, which should be done at a higher level than this method,
+            /// e.g. [`Wire`] does this whenever a procedure call is started).
+            $($async)? fn wait_for_message_creation(&self, message_id: IpfiInteger) -> Result<(), Error> {
                 // If the message buffer is already present, return immediately, otherwise register a creation
-                // lock and wait for it
+                // lock and wait for it (a poisoned creation lock and a message buffer that exists would be
+                // indicative of a different message having been created, which, frankly, we don't care about
+                // at the interface level, that's a wire problem)
+                //
+                // Note that the wire allocates buffers for responses the second it starts a procedure call,
+                // so it will never poison them (these semantics are therefore only used at the interface level,
+                // which is low-level enough that we can do this comfortably)
                 if self.messages.get(&message_id).is_none() {
                     let lock = if let Some(lock) = self.creation_locks.get(&message_id) {
                         lock.clone()
@@ -749,12 +850,25 @@ macro_rules! define_interface {
                         lock
                     };
 
-                    lock.wait_for_completion()$(.$await)?;
+                    let state = lock.wait_for_completion()$(.$await)?;
+                    if state == CompleteLockState::Poisoned {
+                        return Err(Error::LockPoisoned { index: message_id })
+                    }
                     // Now delete that lock to free up some space
                     // Note that our read-only creation locks instance will definitely have been dropped
                     // by this point
                     self.creation_locks.remove(&message_id);
                 };
+
+                Ok(())
+            }
+            /// Gets the [`CompleteLock`] for the given message, if it exists.
+            pub(crate) fn get_complete_lock(&self, message_id: IpfiInteger) -> Option<CompleteLock> {
+                if let Some(message) = self.messages.get(&message_id) {
+                    Some(message.complete_lock.clone())
+                } else {
+                    None
+                }
             }
         }
     };
@@ -855,7 +969,7 @@ macro_rules! define_interface_tests {
             interface.terminate_message(0)$(.$await)?.unwrap();
             // We haven't fetched, so this should increment
             assert_eq!(interface.push()$(.$await)?, 1);
-            let msg = interface.get_raw(0)$(.$await)?;
+            let msg = interface.get_raw(0)$(.$await)?.unwrap();
             assert_eq!(msg[0], [42]);
             // But now we have fetched from the ID, so it should be reused
             assert_eq!(interface.push()$(.$await)?, 0);
@@ -889,7 +1003,7 @@ macro_rules! define_interface_tests {
             let interface = Interface::new();
             let id = interface.push()$(.$await)?;
             assert!(interface.terminate_message(id)$(.$await)?.is_ok());
-            let msg = interface.get_raw(id)$(.$await)?;
+            let msg = interface.get_raw(id)$(.$await)?.unwrap();
             assert_eq!(msg[0], []);
         }
         #[$test_attr]
@@ -897,44 +1011,44 @@ macro_rules! define_interface_tests {
             let interface = Interface::new();
             let id = interface.push()$(.$await)?;
             // This will resolve immediately because the message has been created
-            let mut rx = interface.get_chunk_stream(id)$(.$await)?;
+            let mut rx = interface.get_chunk_stream(id)$(.$await)?.unwrap();
 
             interface.send(42, id)$(.$await)?.unwrap();
             interface.terminate_chunk(id)$(.$await)?.unwrap();
-            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [42]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap().unwrap(), [42]);
             interface.send(43, id)$(.$await)?.unwrap();
             // We don't terminate that final chunk!
             interface.terminate_message(id)$(.$await)?.unwrap();
-            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [43]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap().unwrap(), [43]);
 
-            assert!(rx.recv_raw()$(.$await)?.is_none());
+            assert!(rx.recv_raw()$(.$await)?.unwrap().is_none());
 
-            // Getting the buffer itself should fail or be empty, depending on the method used
-            #[cfg(feature = "serde")]
-            assert!(interface.get_chunks::<()>(id)$(.$await)?.unwrap().is_none());
-            assert_eq!(interface.get_raw(id)$(.$await)?, [[]]);
+            // Make sure the message buffer has been reallocated
+            let new_id = interface.push()$(.$await)?;
+            assert_eq!(id, new_id);
         }
         #[$test_attr]
         $($async)? fn stream_then_drop_rx_should_buffer() {
             let interface = Interface::new();
             let id = interface.push()$(.$await)?;
             // This will resolve immediately because the message has been created
-            let mut rx = interface.get_chunk_stream(id)$(.$await)?;
+            let mut rx = interface.get_chunk_stream(id)$(.$await)?.unwrap();
 
             interface.send(42, id)$(.$await)?.unwrap();
             interface.terminate_chunk(id)$(.$await)?.unwrap();
-            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [42]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap().unwrap(), [42]);
             // Now drop the receiver: future chunks should be buffered
             drop(rx);
             interface.send(43, id)$(.$await)?.unwrap();
             // We don't terminate that final chunk!
+            // Because the receiver has been dropped, the message buffer should not be recycled
             interface.terminate_message(id)$(.$await)?.unwrap();
 
             // Getting the buffer itself should fail, but, getting the raw bytes should show
             // the last chunk buffered (as it couldn't be sent)
             #[cfg(feature = "serde")]
             assert!(interface.get_chunks::<()>(id)$(.$await)?.unwrap().is_none());
-            assert_eq!(interface.get_raw(id)$(.$await)?, [[43]]);
+            assert_eq!(interface.get_raw(id)$(.$await)?.unwrap(), [[43]]);
         }
         #[cfg(feature = "serde")]
         #[$test_attr]

@@ -4,6 +4,17 @@ use std::{
 };
 
 crate::define_wire!(impl Read, impl Write, populate_from_reader);
+// Dropping the wire must mark it as terminated, with all the consequences thereof, and then relinquish the
+// wire's identifier so it can be reused on the interface (we don't do that in termination because the wire
+// is still technically active, and we don't want to risk a possibly very bad cross-wire race condition)
+impl Drop for Wire<'_> {
+    fn drop(&mut self) {
+        // For the blocking API, this is trivial!
+        self.mark_terminated();
+        // Relinquish the ID last to prevent nasty race conditions
+        self.interface.relinquish_id(self.id);
+    }
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Wire<'static> {
@@ -51,4 +62,31 @@ impl AutonomousWireHandle {
 #[cfg(test)]
 mod tests {
     crate::define_wire_tests!(test);
+
+    #[test]
+    fn wire_termination_should_halt_ongoing_receiver() {
+        let mut alice = Actor::new();
+        let mut bob = Actor::new();
+        alice.interface.add_procedure(0, move |(): ()| 42);
+
+        let handle = bob.wire.call(ProcedureIndex(0), ()).unwrap();
+        let mut rx = handle.wait_chunk_stream().unwrap();
+        let thread = std::thread::spawn(move || {
+            // This will start immediately, so we're testing the ongoing checking of the complete lock
+            rx.recv::<u32>()
+        });
+
+        alice.input.set_position(0);
+        // Immediately terminate Alice's wire before Bob's procedure call can go through
+        alice.wire.signal_termination();
+        alice.wire.flush_end(&mut bob.input).unwrap();
+        drop(alice);
+        bob.input.set_position(0);
+        bob.wire.fill(&mut bob.input).unwrap();
+
+        // Wait for the thread's result (it won't have panicked)
+        let result = thread.join().unwrap();
+        // It should be that the receiver failed
+        assert!(result.is_err());
+    }
 }

@@ -1,3 +1,4 @@
+use crate::CompleteLockState;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
@@ -6,39 +7,56 @@ use tokio::sync::{Mutex, Notify};
 // NOTE: This is now supported on Wasm!
 #[derive(Clone)]
 pub(crate) struct CompleteLock {
-    pair: Arc<(Mutex<bool>, Notify)>,
+    pair: Arc<(Mutex<CompleteLockState>, Notify)>,
 }
 impl CompleteLock {
+    /// Creates a new, incomplete, lock.
     pub(crate) fn new() -> Self {
         Self {
-            pair: Arc::new((Mutex::new(false), Notify::new())),
+            pair: Arc::new((Mutex::new(CompleteLockState::Incomplete), Notify::new())),
         }
     }
-    pub(crate) async fn completed(&self) -> bool {
+    /// Gets the current state of the lock.
+    pub(crate) async fn state(&self) -> CompleteLockState {
         let (lock, _) = &*self.pair;
         *lock.lock().await
     }
+    /// Marks the lock as complete. If the lock was previously poisoned, this will override that.
     pub(crate) async fn mark_complete(&self) {
-        let (lock, notifier) = &*self.pair;
-        *lock.lock().await = true;
-        notifier.notify_waiters();
+        let (lock, cvar) = &*self.pair;
+        *lock.lock().await = CompleteLockState::Complete;
+        cvar.notify_waiters();
     }
-    pub(crate) async fn wait_for_completion(&self) {
+    /// Poisons the lock, signalling to any waiters that what it guards is now in an invalid
+    /// state.
+    pub(crate) async fn poison(&self) {
+        let (lock, cvar) = &*self.pair;
+        let mut state = lock.lock().await;
+        // We can only poison incomplete locks
+        if *state == CompleteLockState::Incomplete {
+            *state = CompleteLockState::Poisoned;
+            cvar.notify_waiters();
+        }
+    }
+    /// Waits until the lock is completed, returning its state. This will also return
+    /// if/when the lock is explicitly poisoned.
+    #[must_use] // Must check for poisoning!
+    pub(crate) async fn wait_for_completion(&self) -> CompleteLockState {
         let (lock, notifier) = &*self.pair;
         // Perform an outright check first
-        let completed = lock.lock().await;
-        if *completed {
-            return;
+        let state = lock.lock().await;
+        if *state != CompleteLockState::Incomplete {
+            return *state;
         }
-        drop(completed);
+        drop(state);
 
         loop {
             // Wait to be notified about completion
             notifier.notified().await;
             // And check the guard, otherwise waiting again
-            let completed = lock.lock().await;
-            if *completed {
-                break;
+            let state = lock.lock().await;
+            if *state != CompleteLockState::Incomplete {
+                return *state;
             }
         }
     }
@@ -47,6 +65,7 @@ impl CompleteLock {
 #[cfg(test)]
 mod tests {
     use super::CompleteLock;
+    use crate::CompleteLockState;
 
     #[tokio::test]
     async fn should_unlock_waiter_no_threads() {
@@ -54,8 +73,8 @@ mod tests {
         let lock = CompleteLock::new();
 
         lock.mark_complete().await;
-        lock.wait_for_completion().await;
-        assert!(lock.completed().await);
+        let state = lock.wait_for_completion().await;
+        assert_eq!(state, CompleteLockState::Complete);
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
@@ -64,13 +83,13 @@ mod tests {
 
         let lock_1 = lock.clone();
         let waiter_1 = tokio::task::spawn(async move {
-            lock_1.wait_for_completion().await;
+            let _ = lock_1.wait_for_completion().await;
             true
         });
 
         let lock_2 = lock.clone();
         let waiter_2 = tokio::task::spawn(async move {
-            lock_2.wait_for_completion().await;
+            let _ = lock_2.wait_for_completion().await;
             true
         });
 
@@ -85,5 +104,13 @@ mod tests {
         assert!(res_1 == res_2 && res_1 == true);
 
         Ok(())
+    }
+    #[tokio::test]
+    async fn poison_should_unlock() {
+        let lock = CompleteLock::new();
+
+        lock.poison().await;
+        let state = lock.wait_for_completion().await;
+        assert_eq!(state, CompleteLockState::Poisoned);
     }
 }

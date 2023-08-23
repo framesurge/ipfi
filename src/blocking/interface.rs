@@ -1,6 +1,18 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 
 crate::define_interface!();
+impl ChunkReceiver {
+    fn recv_timeout(&mut self, millis: usize) -> Option<Option<Vec<u8>>> {
+        match self
+            .rx
+            .recv_timeout(std::time::Duration::from_millis(millis as u64))
+        {
+            Ok(val) => Some(Some(val)),
+            Err(RecvTimeoutError::Disconnected) => Some(None),
+            Err(RecvTimeoutError::Timeout) => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -42,7 +54,7 @@ mod tests {
         assert!(!msg.is_finished());
         interface.terminate_message(id).unwrap();
 
-        let msg = msg.join().unwrap();
+        let msg = msg.join().unwrap().unwrap();
         assert_eq!(msg[0], [42]);
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -68,7 +80,7 @@ mod tests {
         assert!(!msg.is_finished());
         interface.terminate_message(0).unwrap();
 
-        let msg = msg.join().unwrap();
+        let msg = msg.join().unwrap().unwrap();
         assert_eq!(msg[0], [42]);
     }
 }

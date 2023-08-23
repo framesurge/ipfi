@@ -90,3 +90,15 @@ pub enum Terminator {
     Chunk,
     None,
 }
+
+/// The state of a completion lock.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub(crate) enum CompleteLockState {
+    /// Still waiting for someone to mark this lock as complete.
+    Incomplete,
+    /// The lock has been marked as complete.
+    Complete,
+    /// The lock has been poisoned: whatever it was guarding is almost certainly in
+    /// an invalid state.
+    Poisoned,
+}

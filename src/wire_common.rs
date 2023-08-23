@@ -22,9 +22,9 @@ macro_rules! define_wire {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
-        use super::ChunkReceiver;
+        use super::{ChunkReceiver, complete_lock::CompleteLock};
 
-        const DEFAULT_MAX_ONGOING_PROCEDURES: IpfiInteger = 25; // TODO
+        const DEFAULT_MAX_ONGOING_PROCEDURES: IpfiInteger = 10; // TODO
 
         /// A mechanism to interact ergonomically with an interface using synchronous Rust I/O buffers.
         ///
@@ -117,6 +117,10 @@ macro_rules! define_wire {
             /// simultaneously. This is used to prevent DoS attacks based on sending partial arguments for many calls, or based on
             /// executing resource-heavy procedures en-masse.
             max_ongoing_procedures: IpfiInteger,
+            /// A map of response indices in the attached interface to their completion locks, for call handles generated from procedure
+            /// calls made on this wire that are waiting/unwaited upon. This is used when the wire is dropped to automatically poison these
+            /// locks, preventing call handles from hanging forever on wire termination.
+            idle_call_handles: Arc<DashMap<IpfiInteger, CompleteLock, BuildNoHashHasher<IpfiInteger>>>,
             /// A flag for whether or not this wire has been terminated. Once it has been, *all* further operations will fail.
             terminated: Arc<AtomicBool>,
         }
@@ -145,6 +149,7 @@ macro_rules! define_wire {
                     response_idx_map: Arc::new(DashMap::default()),
                     ongoing_procedures: Arc::new(DashSet::default()),
                     max_ongoing_procedures: DEFAULT_MAX_ONGOING_PROCEDURES,
+                    idle_call_handles: Arc::new(DashMap::default()),
 
                     // If we detect an EOF, this will be set
                     terminated: Arc::new(AtomicBool::new(false)),
@@ -163,10 +168,25 @@ macro_rules! define_wire {
                     response_idx_map: Arc::new(DashMap::default()),
                     ongoing_procedures: Arc::new(DashSet::default()),
                     max_ongoing_procedures: DEFAULT_MAX_ONGOING_PROCEDURES,
+                    idle_call_handles: Arc::new(DashMap::default()),
 
                     // If we detect an EOF, this will be set
                     terminated: Arc::new(AtomicBool::new(false)),
                 }
+            }
+            /// Sets the maximum number of ongoing procedures that the other end of this wire may invoke. "Ongoing procedures"
+            /// refer to two things: procedures that are still accumulating arguments, and procedures that haven't finished
+            /// executing yet. By setting a maximum number for these and rejecting any past that, we can prevent denial-of-service
+            /// attacks that try to overload our end of the wire by starting too many procedure calls at once.
+            ///
+            /// The default for this is 10, but this value may change without warning until v1.0, so you're advised to set
+            /// this manually when DoS protection matters!
+            ///
+            /// For protecting a server, this should be combined with [`Self::new_module`], which will prevent this wire from
+            /// processing response messages, which can be used to exhaust memory if used maliciously.
+            pub fn max_ongoing_procedures(mut self, value: IpfiInteger) -> Self {
+                self.max_ongoing_procedures = value;
+                self
             }
             /// Asks the wire whether or not it has been terminated. This polls an internal flag that can be read by many threads
             /// simultaneously, and as such this operation is cheap.
@@ -298,6 +318,9 @@ macro_rules! define_wire {
                         CallIndex(0)
                     };
                 // Allocate a new message buffer on the interface that we'll receive the response into
+                //
+                // NOTE: The fact that we allocate this immediately means we never have to poison creation
+                // locks if the wire terminates, it's safe to poison the completion locks only
                 let response_idx = self.interface.push()$(.$await)?;
                 // Add that to the remote index map so we can retrieve it for later continutation and termination
                 // of this call
@@ -318,10 +341,11 @@ macro_rules! define_wire {
 
                 // Get the response index we're using
                 let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
-                Ok(CallHandle {
+                Ok(CallHandle::new(
                     response_idx,
-                    interface: self.interface,
-                })
+                    self.interface,
+                    self.idle_call_handles.clone(),
+                ))
             }
             /// Continues the procedure call with the given remote procedure index and call index by sending the given arguments.
             /// This will not terminate the message, and will leave it open for calling.
@@ -406,10 +430,11 @@ macro_rules! define_wire {
 
                 // Get the response index we're using
                 let response_idx = self.get_response_idx(procedure_idx, call_idx)?;
-                Ok(CallHandle {
+                Ok(CallHandle::new(
                     response_idx,
-                    interface: self.interface,
-                })
+                    self.interface,
+                    self.idle_call_handles.clone(),
+                ))
             }
             /// Gets the local response buffer index for the given procedure and call indices. If no such buffer has been allocated,
             /// this will return an error.
@@ -438,13 +463,20 @@ macro_rules! define_wire {
             /// and start doing other work. This does not signal the termination of the wire, or even that there will not be any input in future,
             /// it simply allows you to signal to the remote that it should start doing something else. Internally, the reception of this case is
             /// generally not handled, and it is up to you as a user to handle it.
-            pub fn signal_end_of_input(&self) {
+            pub fn signal_end_of_input(&self) -> Result<(), Error> {
+                if self.is_terminated() {
+                    return Err(Error::WireTerminated);
+                }
                 let msg = Message::EndOfInput;
                 let bytes = msg.to_bytes();
                 self.queue.push(bytes);
+
+                Ok(())
             }
             /// Writes a termination signal to the output, which will permanently neuter this connection, and all further operations on this wire
-            /// will fail.
+            /// will fail. This will **not** mark this wire as terminated internally, but it will lead to the termination of the other side's wire.
+            /// To mark this wire as terminated (thereby halting ongoing procedures, etc.), you should drop it, or allow it to receive a termination
+            /// signal from the other side.
             ///
             /// This does a similar thing to [`signal_termination`], except that this also requires flushing, and it can be more useful if `wire.open`
             /// has consumed the writer handle. However, if you need to send a termination signal when your program shuts down after any errors,
@@ -456,11 +488,41 @@ macro_rules! define_wire {
             }
             /// Sets the internal termination flag to `true`, causing all subsequent operations to fail. This will also cause all
             /// ongoing streaming procedures to have their next `yielder()` call return an error, leading them to fail (in most cases).
-            /// In other words, this will single-handedly terminate all active work on this wire. However, buffers allocated for
-            /// accumulating procedure call arguments will only be dropped once the wire itself is dropped.
-            fn mark_terminated(&self) {
-                // We use `Ordering::Release` to make sure that all subsequent reads see this
+            /// In other words, this will single-handedly terminate all active work on this wire. This will also drop all message buffers
+            /// that were being used to accumulate arguments for procedure calls.
+            ///
+            /// Additionally, this will poison the completion locks of all responses to procedure calls made over this wire that have
+            /// not yet been gotten.
+            ///
+            /// This is not accessible externally because termination should only occur when a termination signal is received, or when
+            /// the wire is dropped (there is literally nothing you can do with it once it's terminated, so we may as well keep the
+            /// interface simpler, especially with names like `.signal_termination()` floating about).
+            // NOTE: If any part of this method changes, the `Drop` impl must be updated too
+            $($async)? fn mark_terminated(&self) {
+                self.mark_terminated_sync();
+                Self::poison_idle_call_handles(&self.idle_call_handles)$(.$await)?
+            }
+            /// Internal function for the synchronous parts of the termination implementation. This simplifies the drop implementation.
+            fn mark_terminated_sync(&self) {
+                // We use `Ordering::Release` to make sure that all subsequent reads see this.
+                // This will cause all ongoing procedures to fail in their next yield.
                 self.terminated.store(true, Ordering::Release);
+                // Drop all message buffers that were being used to accumulate arguments for procedure calls (effectively cancelling
+                // calls that were getting ready to start, but which hadn't yet)
+                for entry in self.ongoing_procedures.iter() {
+                    self.interface.drop_associated_call_message(entry.0, entry.1, self.id);
+                }
+            }
+            /// Internal associated function for the (possibly) asynchronous parts of the termination implementation (that doesn't depend on `self`).
+            $($async)? fn poison_idle_call_handles(idle_call_handles: impl AsRef<DashMap<IpfiInteger, CompleteLock, BuildNoHashHasher<IpfiInteger>>>) {
+                // Poison the completion locks of any call handles that either haven't been waited on yet, or that are being
+                // waited on actively (note that it doesn't matter if one doesn't get removed in time, because the complete locks are
+                // literal clones, we don't look them up by message identifier; it's still important that they're cleaned out though,
+                // to avoid a memory exhaustion DoS attack)
+                for entry in idle_call_handles.as_ref().iter() {
+                    // Note that any of these that have actually completed will not really be poisoned
+                    entry.value().poison()$(.$await)?;
+                }
             }
 
             /// Receives a single message from the given reader, sending it into the interface as appropriate. This contains
@@ -632,7 +694,10 @@ macro_rules! define_wire {
                     // This is the IPFI equivalent of 'expected EOF'
                     0 => {
                         // This will lead all other operation to fail, potentially in the middle of their work
-                        self.mark_terminated();
+                        //
+                        // This is also very neat, because it means terminations on the other side, which might fail
+                        // streaming procedures, can be used to kill receivers for their output on our side too!
+                        self.mark_terminated()$(.$await)?;
 
                         Ok(None)
                     }
@@ -676,7 +741,7 @@ macro_rules! define_wire {
                     return Err(Error::WireTerminated);
                 }
 
-                self.signal_end_of_input();
+                self.signal_end_of_input()?;
                 self.flush_partial(writer)$(.$await)?
             }
             /// Flushes everything that has been written to this wire, along with a termination signal, which tells the remote that your
@@ -736,7 +801,7 @@ macro_rules! define_wire {
                         // certainly terminated from that buffer
                         Err(Error::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
                             // This will prevent all further operations on this wire
-                            self.mark_terminated();
+                            self.mark_terminated()$(.$await)?;
                             break Err(Error::IoError(err));
                         }
                         // Any unexpected errors should be propagated
@@ -745,21 +810,8 @@ macro_rules! define_wire {
                 }
             }
         }
-        // Dropping the wire must:
-        //  1. Mark it as terminated to make any ongoing streaming procedures terminate (at their discretion),
-        //  2. Drop all messages for procedure calls that were still accumulating, to prevent memroy-based DoS attacks,
-        //  3. And relinquish this wire's identifier so it can be reused on the interface.
-        impl Drop for Wire<'_> {
-            fn drop(&mut self) {
-                // Useful because this `Arc<AtomicBool>` is shared with all ongoing streaming procedures
-                self.mark_terminated();
-                for entry in self.ongoing_procedures.iter() {
-                    self.interface.drop_associated_call_message(entry.0, entry.1, self.id);
-                }
-                // Relinquish the ID last to prevent nasty race conditions
-                self.interface.relinquish_id(self.id);
-            }
-        }
+
+        // Drop implementation is outside this macro
 
         /// A handle for waiting on the return values of remote procedure calls. This is necessary because calling a remote procedure
         /// requires `.flush()` to be called, so waiting inside a function like `.call()` would make very little sense.
@@ -774,33 +826,82 @@ macro_rules! define_wire {
             response_idx: IpfiInteger,
             /// The interface where the response will appear.
             interface: &'a Interface,
+            /// The same map of idle call handles that the [`Wire`] which produces this call handle holds. This is necessary because
+            /// the wire completely stops caring about a procedure call once it's abstracted out to a call handle, so we have
+            /// to manually remove the response index this call handle tracks from the list of idle handles as soon as we've definitely
+            /// got the result. That way, we can prevent it from being poisoned.
+            // XXX: Is it theoretically possible for there to be a race condition where we finish up with a message buffer, it gets
+            // recycled, and then, in between removing it, the wire hgets dropped, leading to some other message that has taken up
+            // residence being poisoned? Not sure about this, but we could stop it by holding a mutable reference to the idle call
+            // handles while we wait (but that blocks the entire rest of the wire)...
+            idle_call_handles: Arc<DashMap<IpfiInteger, CompleteLock, BuildNoHashHasher<IpfiInteger>>>,
         }
         impl<'a> CallHandle<'a> {
+            /// Create a new call handle and register it with the wire for auto-poisoning on termination. This requires that the given
+            /// message index has already been created.
+            fn new(
+                response_idx: IpfiInteger,
+                interface: &'a Interface,
+                idle_call_handles: Arc<DashMap<IpfiInteger, CompleteLock, BuildNoHashHasher<IpfiInteger>>>
+            ) -> Self {
+                // Add this call handle to the list
+                let complete_lock = interface.get_complete_lock(response_idx).unwrap();
+                idle_call_handles.insert(response_idx, complete_lock);
+
+                Self {
+                    response_idx,
+                    interface,
+                    idle_call_handles,
+                }
+            }
             /// Waits for the procedure call to complete and returns the result.
+            ///
+            /// **Termination behaviour:** if the wire terminates during this call, the completion lock on the message this waits
+            /// for will be explicitly poisoned, causing this call to fail with [`Error::LockPoisoned`].
             #[cfg(feature = "serde")]
             #[inline]
-            pub $($async)? fn wait<T: DeserializeOwned>(&self) -> Result<T, Error> {
-                self.interface.get(self.response_idx)$(.$await)?
+            pub $($async)? fn wait<T: DeserializeOwned>(self) -> Result<T, Error> {
+                let res = self.interface.get(self.response_idx)$(.$await)??;
+                self.idle_call_handles.remove(&self.response_idx);
+                Ok(res)
             }
             /// Same as `.wait()`, but this will use chunk-based deserialisation, and is intended for use with procedures that send
             /// sequences of discrete values gradually over the wire. For more information, see [`Interface::get_chunks`].
+            ///
+            /// **Termination behaviour:** if the wire terminates during this call, the completion lock on the message this waits
+            /// for will be explicitly poisoned, causing this call to fail with [`Error::LockPoisoned`].
             #[cfg(feature = "serde")]
             #[inline]
-            pub $($async)? fn wait_chunks<T: DeserializeOwned>(&self) -> Result<Option<Vec<T>>, Error> {
-                self.interface.get_chunks(self.response_idx)$(.$await)?
+            pub $($async)? fn wait_chunks<T: DeserializeOwned>(self) -> Result<Option<Vec<T>>, Error> {
+                let res = self.interface.get_chunks(self.response_idx)$(.$await)??;
+                self.idle_call_handles.remove(&self.response_idx);
+                Ok(res)
             }
-            /// Creates a [`ChunkReceiver`] for incrementally receiving each chunk as it arrives. This can be used for accessing
+            /// Creates a [`ChunkReceiverHandle`] for incrementally receiving each chunk as it arrives. This can be used for accessing
             /// data in a semi-realtime way while still abstracting over the issue of partial chunks. This will wait until the
             /// first response data is received before creating a channel.
+            ///
+            /// **Termination behaviour:** if the wire terminates while a receiver is still held, that receiver will be intelligently
+            /// poisoned, and any remaining values will be yielded, before an error is returned that the wire was terminated.
             #[inline]
-            pub $($async)? fn wait_chunk_stream(&self) -> ChunkReceiver {
-                self.interface.get_chunk_stream(self.response_idx)$(.$await)?
+            pub $($async)? fn wait_chunk_stream(self) -> Result<ChunkReceiverHandle, Error> {
+                let rx = self.interface.get_chunk_stream(self.response_idx)$(.$await)??;
+                Ok(ChunkReceiverHandle {
+                    rx,
+                    idle_call_handles: self.idle_call_handles,
+                    response_idx: self.response_idx,
+                })
             }
             /// Same as `.wait()`, but this works directly with bytes. This will return the chunks in the message (to learn more about
             /// chunks, see [`Interface`]).
+            ///
+            /// **Termination behaviour:** if the wire terminates during this call, the completion lock on the message this waits
+            /// for will be explicitly poisoned, causing this call to fail with [`Error::LockPoisoned`].
             #[inline]
-            pub $($async)? fn wait_bytes(&self) -> Vec<Vec<u8>> {
-                self.interface.get_raw(self.response_idx)$(.$await)?
+            pub $($async)? fn wait_bytes(self) -> Result<Vec<Vec<u8>>, Error> {
+                let res = self.interface.get_raw(self.response_idx)$(.$await)??;
+                self.idle_call_handles.remove(&self.response_idx);
+                Ok(res)
             }
             /// Turns this call handle into the response index that can be used directly with the [`Interface`].
             /// This allows using lower-level methods on the interface that aren't accessible on the call
@@ -808,8 +909,63 @@ macro_rules! define_wire {
             ///
             /// This is typically required when you want to check whether or not a call handle is ready
             /// to yield.
+            ///
+            /// **Warning:** calling this will remove the underlying response index from a list the [`Wire`] maintains
+            /// of response buffers that haven't been accessed yet. It uses this list to auto-poison those messages'
+            /// completion locks so that waiting handles don't hang forever if the wire terminates, but, once this is
+            /// called, that tracking can no longer occur! If you call this method, you should be extra careful about
+            /// how you handle a terminating wire, as there will be no automatic poisoning of this response buffer anymore!
             pub fn into_response_idx(self) -> IpfiInteger {
+                self.idle_call_handles.remove(&self.response_idx);
                 self.response_idx
+            }
+        }
+
+        /// A thin wrapper over [`ChunkReceiver`] produced by a [`CallHandle`]. This works with the [`Wire`] internally to coordinate when the receiver
+        /// finishes so the wire knows that it doesn't need to poison the message's complete lock.
+        ///
+        /// This provides no method for turning itself into a [`ChunkReceiver`] because there should be literally no case in which you want to override
+        /// the wire's semantics on this. If you do, then you should abort auto-poisoning behaviour altogether with [`CallHandle::into_response_idx`].
+        pub struct ChunkReceiverHandle {
+            /// The underlying receiver.
+            rx: ChunkReceiver,
+            /// A copy of the idle call handles from the [`Wire`].
+            idle_call_handles: Arc<DashMap<IpfiInteger, CompleteLock, BuildNoHashHasher<IpfiInteger>>>,
+            /// The response index this receiver tracks (used to remove that index from `idle_call_handles` once the receiver is finished).
+            response_idx: IpfiInteger,
+        }
+        impl ChunkReceiverHandle {
+            /// See [`ChunkReceiver::termination_timeout_millis`].
+            pub fn termination_timeout_millis(mut self, millis: usize) -> Self {
+                self.rx = self.rx.termination_timeout_millis(millis);
+                self
+            }
+            /// See [`ChunkReceiver::recv_raw`].
+            pub $($async)? fn recv_raw(&mut self) -> Result<Option<Vec<u8>>, Error> {
+                let res = self.rx.recv_raw()$(.$await)?;
+                match res {
+                    // If the receiver finished smoothly, strike this from the list of handles to poison
+                    Ok(None) => {
+                        self.idle_call_handles.remove(&self.response_idx);
+                        Ok(None)
+                    },
+                    // Otherwise, we're just a thin wrapper
+                    _ => res
+                }
+            }
+            /// See [`ChunkReceiver::recv`].
+            #[cfg(feature = "serde")]
+            pub $($async)? fn recv<T: DeserializeOwned>(&mut self) -> Result<Option<Result<T, Error>>, Error> {
+                let res = self.rx.recv::<T>()$(.$await)?;
+                match res {
+                    // If the receiver finished smoothly, strike this from the list of handles to poison
+                    Ok(None) => {
+                        self.idle_call_handles.remove(&self.response_idx);
+                        Ok(None)
+                    },
+                    // Otherwise, we're just a thin wrapper
+                    _ => res
+                }
             }
         }
 
@@ -892,7 +1048,7 @@ macro_rules! define_wire_tests {
             // Bob likewise reads until he has everything he needs
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
-            let result = handle.unwrap().wait_bytes()$(.$await)?;
+            let result = handle.unwrap().wait_bytes()$(.$await)?.unwrap();
             assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[$test_attr]
@@ -925,7 +1081,7 @@ macro_rules! define_wire_tests {
             bob.input.set_position(0);
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
-            let result = handle.wait_bytes()$(.$await)?;
+            let result = handle.wait_bytes()$(.$await)?.unwrap();
             assert_eq!(result[0], [0, 1, 2, 3, 42]);
 
             // Test cleanup
@@ -951,7 +1107,7 @@ macro_rules! define_wire_tests {
             bob.input.set_position(0);
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
-            let result = handle.wait_bytes()$(.$await)?;
+            let result = handle.wait_bytes()$(.$await)?.unwrap();
             assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[$test_attr]
@@ -996,7 +1152,7 @@ macro_rules! define_wire_tests {
             // Bob likewise reads until he has everything he needs
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
-            let result = handle.unwrap().wait_bytes()$(.$await)?;
+            let result = handle.unwrap().wait_bytes()$(.$await)?.unwrap();
             assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[$test_attr]
@@ -1035,7 +1191,7 @@ macro_rules! define_wire_tests {
             bob.input.set_position(0);
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
-            let result = handle.unwrap().wait_bytes()$(.$await)?;
+            let result = handle.unwrap().wait_bytes()$(.$await)?.unwrap();
             assert_eq!(result[0], [0, 1, 2, 3, 42]);
         }
         #[cfg(feature = "serde")]
@@ -1162,10 +1318,10 @@ macro_rules! define_wire_tests {
             alice
                 .interface
                 .add_sequence_procedure(0, |yielder, (): ()| {
-                    yielder(1, false);
-                    yielder(2, false);
+                    yielder(1, false).unwrap();
+                    yielder(2, false).unwrap();
                     // TODO Way of testing when we don't terminate properly?
-                    yielder(3, true);
+                    yielder(3, true).unwrap();
                 });
 
             let handle = bob.wire.call(ProcedureIndex(0), ())$(.$await)?;
@@ -1192,14 +1348,14 @@ macro_rules! define_wire_tests {
                     // We don't bother with proper delays or the like here, thread management
                     // etc. is solely the responsibility of this function (so we would just
                     // be testing Rust's threading systems, which is redundant)
-                    yielder(1, false);
-                    yielder(2, false);
-                    yielder(3, true);
+                    yielder(1, false).unwrap();
+                    yielder(2, false).unwrap();
+                    yielder(3, true).unwrap();
                 });
 
             let handle = bob.wire.call(ProcedureIndex(0), ())$(.$await)?;
             assert!(handle.is_ok());
-            let mut rx = handle.unwrap().wait_chunk_stream()$(.$await)?;
+            let mut rx = handle.unwrap().wait_chunk_stream()$(.$await)?.unwrap();
 
             bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
             alice.input.set_position(0);
@@ -1208,11 +1364,85 @@ macro_rules! define_wire_tests {
             bob.input.set_position(0);
             bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
 
-            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [1]);
-            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [2]);
-            assert_eq!(rx.recv_raw()$(.$await)?.unwrap(), [3]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap().unwrap(), [1]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap().unwrap(), [2]);
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap().unwrap(), [3]);
 
-            assert!(rx.recv_raw()$(.$await)?.is_none());
+            assert!(rx.recv_raw()$(.$await)?.unwrap().is_none());
+        }
+        #[$test_attr]
+        $($async)? fn terminating_wire_should_halt_waiting_call_handle() {
+            let mut alice = Actor::new();
+            let mut bob = Actor::new();
+            alice
+                .interface
+                .add_sequence_procedure(0, move |yielder, (): ()| {
+                    // This procedure will never finish, so we'd be waiting forever if
+                    // the wire didn't terminate
+                    yielder(1, false).unwrap();
+                });
+
+            let handle = bob.wire.call(ProcedureIndex(0), ())$(.$await)?;
+            assert!(handle.is_ok());
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            // After we mark the wire as terminated, all further yields on ongoing streaming
+            // procedures should fail, signalling them to terminate at their discretion
+            alice.wire.signal_termination();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            drop(alice);
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+
+            // The handle should also have been poisoned
+            assert!(handle.unwrap().wait_bytes()$(.$await)?.is_err());
+        }
+        #[$test_attr]
+        $($async)? fn terminating_wire_should_halt_streaming_procedure() {
+            use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+            let mut alice = Actor::new();
+            let mut bob = Actor::new();
+            let yield_failed = Arc::new(AtomicBool::new(false));
+            let yf = yield_failed.clone();
+            alice
+                .interface
+                .add_sequence_procedure(0, move |yielder, (): ()| {
+                    yielder(1, false).unwrap();
+                    let yf = yf.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        // By now, the wire should have been terminated
+                        yf.store(yielder(2, true).is_err(), Ordering::Release);
+                    });
+                });
+
+            let handle = bob.wire.call(ProcedureIndex(0), ())$(.$await)?;
+            assert!(handle.is_ok());
+            let mut rx = handle.unwrap().wait_chunk_stream()$(.$await)?.unwrap();
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            // After we mark the wire as terminated, all further yields on ongoing streaming
+            // procedures should fail, signalling them to terminate at their discretion
+            alice.wire.signal_termination();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            drop(alice);
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            assert!(yield_failed.load(Ordering::Acquire));
+
+            // Even though the receiver is now poisoned, we should be able to get the last sent
+            // value
+            assert_eq!(rx.recv_raw()$(.$await)?.unwrap().unwrap(), [1]);
+
+            // After that, though, there should be nothing
+            assert!(rx.recv_raw()$(.$await)?.is_err());
         }
     };
 }

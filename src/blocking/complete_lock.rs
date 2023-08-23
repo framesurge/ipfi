@@ -1,40 +1,59 @@
+use crate::CompleteLockState;
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex};
 
 /// A completion lock based on `Condvar`s, which are the most efficient mechanism for
 /// this kind of lock on platforms that support them.
-// NOTE: This is now supported on Wasm!
 #[derive(Clone)]
 pub(crate) struct CompleteLock {
-    pair: Arc<(Mutex<bool>, Condvar)>,
+    pair: Arc<(Mutex<CompleteLockState>, Condvar)>,
 }
 impl CompleteLock {
+    /// Creates a new, incomplete, lock.
     pub(crate) fn new() -> Self {
         Self {
-            pair: Arc::new((Mutex::new(false), Condvar::new())),
+            pair: Arc::new((Mutex::new(CompleteLockState::Incomplete), Condvar::new())),
         }
     }
-    pub(crate) fn completed(&self) -> bool {
+    /// Gets the current state of the lock.
+    pub(crate) fn state(&self) -> CompleteLockState {
         let (lock, _) = &*self.pair;
         *lock.lock().unwrap()
     }
+    /// Marks the lock as complete. If the lock was previously poisoned, this will override that.
     pub(crate) fn mark_complete(&self) {
         let (lock, cvar) = &*self.pair;
-        *lock.lock().unwrap() = true;
+        *lock.lock().unwrap() = CompleteLockState::Complete;
         cvar.notify_all();
     }
-    pub(crate) fn wait_for_completion(&self) {
+    /// Poisons the lock, signalling to any waiters that what it guards is now in an invalid
+    /// state.
+    pub(crate) fn poison(&self) {
         let (lock, cvar) = &*self.pair;
-        let mut completed = lock.lock().unwrap();
-        while !*completed {
-            completed = cvar.wait(completed).unwrap();
+        let mut state = lock.lock().unwrap();
+        // We can only poison incomplete locks
+        if *state == CompleteLockState::Incomplete {
+            *state = CompleteLockState::Poisoned;
+            cvar.notify_all();
         }
+    }
+    /// Waits until the lock is completed, returning its state. This will also return
+    /// if/when the lock is explicitly poisoned.
+    #[must_use] // Must check for poisoning!
+    pub(crate) fn wait_for_completion(&self) -> CompleteLockState {
+        let (lock, cvar) = &*self.pair;
+        let mut state = lock.lock().unwrap();
+        while *state == CompleteLockState::Incomplete {
+            state = cvar.wait(state).unwrap();
+        }
+        *state
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::CompleteLock;
+    use crate::CompleteLockState;
 
     /// The amount of time we should wait for threads to be updated by a `CompleteLock`, in milliseconds.
     static THREAD_WAITING_TIME: u64 = 400;
@@ -45,8 +64,8 @@ mod tests {
         let lock = CompleteLock::new();
 
         lock.mark_complete();
-        lock.wait_for_completion();
-        assert!(lock.completed());
+        let state = lock.wait_for_completion();
+        assert_eq!(state, CompleteLockState::Complete);
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -55,13 +74,13 @@ mod tests {
 
         let lock_1 = lock.clone();
         let waiter_1 = std::thread::spawn(move || {
-            lock_1.wait_for_completion();
+            let _ = lock_1.wait_for_completion();
             true
         });
 
         let lock_2 = lock.clone();
         let waiter_2 = std::thread::spawn(move || {
-            lock_2.wait_for_completion();
+            let _ = lock_2.wait_for_completion();
             true
         });
 
@@ -80,5 +99,13 @@ mod tests {
         assert!(res_1 == res_2 && res_1 == true);
 
         Ok(())
+    }
+    #[test]
+    fn poison_should_unlock() {
+        let lock = CompleteLock::new();
+
+        lock.poison();
+        let state = lock.wait_for_completion();
+        assert_eq!(state, CompleteLockState::Poisoned);
     }
 }

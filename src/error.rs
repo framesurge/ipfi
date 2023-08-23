@@ -31,6 +31,8 @@ pub enum Error {
     NoCallBuffer { index: IpfiInteger },
     #[error("procedure call buffer with index {index} is incomplete (attempted to call procedure before argument reception was complete)")]
     CallBufferIncomplete { index: IpfiInteger },
+    #[error("procedure call buffer with index {index} has been poisoned (attempted to call procedure with argments in an invalid state)")]
+    CallBufferPoisoned { index: IpfiInteger },
     // This should basically never occur
     #[error("couldn't write length marker for accumulated arguments (likely spontaneous failure)")]
     WriteLenMarkerFailed,
@@ -42,4 +44,6 @@ pub enum Error {
     IdxTooBig,
     #[error("read a non-compliant terminator `01` (valid values are `00`, `10`, and `11`)")]
     InvalidTerminator,
+    #[error("found a poisoned creation/completion lock when trying to wait on the message with index {index} (it is unlikely that this message will ever be completed, but it is possible in rare cases)")]
+    LockPoisoned { index: IpfiInteger },
 }
