@@ -1444,5 +1444,126 @@ macro_rules! define_wire_tests {
             // After that, though, there should be nothing
             assert!(rx.recv_raw()$(.$await)?.is_err());
         }
+        #[$test_attr]
+        $($async)? fn too_many_accumulating_calls_should_fail() {
+            let mut alice = Actor::new();
+            alice.wire = alice.wire.max_ongoing_procedures(2);
+            let mut bob = Actor::new();
+            alice
+                .interface
+                .add_procedure(0, move |(num,): (u32,)| {
+                    num + 42
+                });
+
+            let call_idx_1 = bob.wire.start_call_with_partial_args(ProcedureIndex(0), (0,))$(.$await)?.unwrap();
+            let call_idx_2 = bob.wire.start_call_with_partial_args(ProcedureIndex(0), (0,))$(.$await)?.unwrap();
+            // This should be rejected
+            let call_idx_3 = bob.wire.start_call_with_partial_args(ProcedureIndex(0), (0,))$(.$await)?.unwrap();
+
+            let handle_1 = bob.wire.end_given_call(ProcedureIndex(0), call_idx_1).unwrap();
+            let handle_2 = bob.wire.end_given_call(ProcedureIndex(0), call_idx_2).unwrap();
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+            alice.input = Cursor::new(Vec::new());
+            bob.input = Cursor::new(Vec::new());
+
+            assert_eq!(handle_1.wait_bytes()$(.$await)?.unwrap()[0], [42]);
+            assert_eq!(handle_2.wait_bytes()$(.$await)?.unwrap()[0], [42]);
+
+            // A new call should work perfectly well
+            let handle_4 = bob.wire.call(ProcedureIndex(0), (0,))$(.$await)?.unwrap();
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+            alice.input = Cursor::new(Vec::new());
+            bob.input = Cursor::new(Vec::new());
+
+            assert_eq!(handle_4.wait_bytes()$(.$await)?.unwrap()[0], [42]);
+
+            // But, as our original third call was rejected, trying to finish it will fail
+            let _ = bob.wire.end_given_call(ProcedureIndex(0), call_idx_3).unwrap();
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            assert!(alice.wire.fill(&mut alice.input)$(.$await)?.is_err());
+        }
+        #[$test_attr]
+        $($async)? fn under_limit_of_simultaneous_calls_should_succeed() {
+            use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
+
+            let mut alice = Actor::new();
+            let mut bob = Actor::new();
+            let num_calls = Arc::new(AtomicU8::new(0));
+            let nc = num_calls.clone();
+            alice
+                .interface
+                .add_sequence_procedure(0, move |yielder, (): ()| {
+                    let nc = nc.clone();
+                    std::thread::spawn(move || {
+                        nc.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        yielder(42, true).unwrap();
+                    });
+                });
+
+            // We won't wait for any of these, we'll just directly check how many times the procedure has executed
+            let _ = bob.wire.call(ProcedureIndex(0), ())$(.$await)?.unwrap();
+            let _ = bob.wire.call(ProcedureIndex(0), ())$(.$await)?.unwrap();
+            let _ = bob.wire.call(ProcedureIndex(0), ())$(.$await)?.unwrap();
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+
+            // NOTE: Timing is a bit tight here, spurious failures *may* occur (try raising the 15ms above and this)
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(num_calls.load(Ordering::SeqCst), 3);
+        }
+        #[$test_attr]
+        $($async)? fn too_many_simultaneous_calls_should_fail() {
+            use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
+
+            let mut alice = Actor::new();
+            alice.wire = alice.wire.max_ongoing_procedures(2);
+            let mut bob = Actor::new();
+            let num_calls = Arc::new(AtomicU8::new(0));
+            let nc = num_calls.clone();
+            alice
+                .interface
+                .add_sequence_procedure(0, move |yielder, (): ()| {
+                    let nc = nc.clone();
+                    std::thread::spawn(move || {
+                        nc.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(15));
+                        yielder(42, true).unwrap();
+                    });
+                });
+
+            // We won't wait for any of these, we'll just directly check how many times the procedure has executed
+            let _ = bob.wire.call(ProcedureIndex(0), ())$(.$await)?.unwrap();
+            let _ = bob.wire.call(ProcedureIndex(0), ())$(.$await)?.unwrap();
+            let _ = bob.wire.call(ProcedureIndex(0), ())$(.$await)?.unwrap();
+
+            bob.wire.flush_end(&mut alice.input)$(.$await)?.unwrap();
+            alice.input.set_position(0);
+            alice.wire.fill(&mut alice.input)$(.$await)?.unwrap();
+            alice.wire.flush_end(&mut bob.input)$(.$await)?.unwrap();
+            bob.input.set_position(0);
+            bob.wire.fill(&mut bob.input)$(.$await)?.unwrap();
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(num_calls.load(Ordering::SeqCst), 2);
+        }
     };
 }
