@@ -7,6 +7,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().collect::<Vec<_>>();
     let num_benches = args[1].parse::<usize>()?;
 
+    println!("Using {num_benches} runs.");
+    if num_benches <= 10 {
+        println!("[WARNING]: Small number of benchmark runs, results may be inaccurate.");
+    } else if num_benches <= 1000 {
+        println!("[INFO]: Medium number of benchmark runs, results will be useful, but more runs are advised.");
+    } else if num_benches <= 10000 {
+        println!("[INFO]: High number of benchmark runs, results should be accurate.")
+    } else {
+        println!("[INFO]: Extremely high number of benchmark runs, results should be highly accurate.");
+    }
+
     // This will store the results of the benchmarks for each program, and then they can be efficiently combined,
     // rather than running them for every possible combination of two
     let mut results = HashMap::new();
@@ -58,27 +69,37 @@ fn bench_x_against_y(
         let y_val = y_metrics
             .get(k)
             .expect("metric disparity (different programs)");
-        let y_differential = calc_percent_differential(*y_val, *x_val);
-        let x_beats_y = y_differential > 0.0;
 
-        let line = format!(
-            "Metric '{}': {} ({:.1}μs) is {:.1}% faster than {} ({:.1}μs).",
-            k,
-            if x_beats_y { x } else { y },
-            if x_beats_y { x_val } else { y_val },
-            y_differential.abs(),
-            if !x_beats_y { x } else { y },
-            if !x_beats_y { x_val } else { y_val },
-        );
+        // I am well aware that there are cleaner ways to do this, but I favour the clarity of this verbose approach
+        let faster;
+        let slower;
+        let faster_time;
+        let slower_time;
+        if x_val < y_val {
+            faster = x;
+            slower = y;
+            faster_time = x_val;
+            slower_time = y_val;
+        } else {
+            faster = y;
+            slower = x;
+            faster_time = y_val;
+            slower_time = x_val;
+        };
+
+        // We are comparing speeds, not times, which resolves a substantial amount of statistical ambiguity!
+        let faster_speed = 1.0 / faster_time;
+        let slower_speed = 1.0 / slower_time;
+
+        let times_faster = faster_speed / slower_speed;
+        // (new - old)/old * 100 = (new/old - 1) * 100 = (times_faster - 1) * 100
+        let percent_diff = (times_faster - 1.0) * 100.0;
+
+        let line = format!("Metric '{k}': {faster} ({faster_time:.1}μs) is {percent_diff:.1}% ({times_faster:.1}x) faster than {slower} ({slower_time:.1}μs).");
         lines.push(line);
     }
 
     Ok(lines.join("\n"))
-}
-
-/// Calculates, as a percentage, how much faster `new` is than `old`. If this is negative, `old` was faster by the given amount.
-fn calc_percent_differential(old: f64, new: f64) -> f64 {
-    ((old - new) / old) * 100.0
 }
 
 fn bench_avg(name: &str, times: usize) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {

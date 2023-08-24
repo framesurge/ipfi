@@ -23,6 +23,11 @@ bench.cmd = [
     "cargo run -- %num_runs"
 ]
 bench.args = [ "num_runs" ]
+# Does 100k runs to make sure we get accurate results for publication
+ci-bench = [
+    "cd benches/harness",
+    "cargo run -- 100000"
+]
 
 release = [
     # We allow specifying a custom version for pre-releases

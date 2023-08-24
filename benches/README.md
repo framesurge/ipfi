@@ -4,27 +4,27 @@ This directory contains some work-in-progress benchmarks of IPFI's performance a
 
 ## Single Procedure Call
 
-This benchmark spins up a server for each of the benchmarked systems and executes a single procedure call against them, measuring the time taken for the client to connect to the server, and the time for a response to be received and validated. In this simple benchmark, IPFI's synchronous API marginally outperforms its asynchronous one, since `tokio` is best suited to higher-load conditions (with connections taking longer to process), and, for a single request, its power is not shown at all. Note that the time taken to actually make a procedure call is actually improved with the asynchronous API, however. The primary speed difference between IPFI and gRPC in this benchmark is the issue that gRPC uses HTTP, and therefore simply needs to transfer vastly more bytes than IPFI's hand-optimised protocol, leading to substantial speed increases (note that 55.8% faster indicates that IPFI is 2.26x faster!).
+This benchmark spins up a server for each of the benchmarked systems and executes a single procedure call against them, measuring the time taken for the client to connect to the server, and the time for a response to be received and validated. In this simple benchmark, IPFI's synchronous API marginally outperforms its asynchronous one, since `tokio` is best suited to higher-load conditions (with connections taking longer to process), and, for a single request, its power is not shown at all. Note that the time taken to actually make a procedure call is actually improved with the asynchronous API, however. The primary speed difference between IPFI and gRPC in this benchmark is the issue that gRPC uses HTTP, and therefore simply needs to transfer vastly more bytes than IPFI's hand-optimised protocol, leading to substantial speed increases.
 
 ### Raw Results
 
+The following were observed after 100k runs of the benchmarks with a custom harness.
+
 ```
 --- ipfi_blocking vs ipfi_async ---
-Metric 'call_time': ipfi_blocking (117.3μs) is 20.2% faster than ipfi_async (14
-7.1μs).
-Metric 'connect_time': ipfi_blocking (30.1μs) is 37.0% faster than ipfi_async (
-47.8μs).
-Metric 'total_time': ipfi_blocking (147.9μs) is 24.3% faster than ipfi_async (195.3μs).
+Metric 'call_time': ipfi_blocking (134.6μs) is 22.8% (1.2x) faster than ipfi_async (165.3μs).
+Metric 'connect_time': ipfi_blocking (31.0μs) is 54.0% (1.5x) faster than ipfi_async (47.8μs).
+Metric 'total_time': ipfi_blocking (166.1μs) is 28.5% (1.3x) faster than ipfi_async (213.6μs).
 
 --- ipfi_blocking vs grpc ---
-Metric 'call_time': ipfi_blocking (117.3μs) is 60.4% faster than grpc (296.5μs).
-Metric 'connect_time': ipfi_blocking (30.1μs) is 78.7% faster than grpc (141.7μs).
-Metric 'total_time': ipfi_blocking (147.9μs) is 66.3% faster than grpc (438.6μs).
+Metric 'call_time': ipfi_blocking (134.6μs) is 119.7% (2.2x) faster than grpc (295.8μs).
+Metric 'connect_time': ipfi_blocking (31.0μs) is 355.0% (4.6x) faster than grpc (141.2μs).
+Metric 'total_time': ipfi_blocking (166.1μs) is 163.3% (2.6x) faster than grpc (437.4μs).
 
 --- ipfi_async vs grpc ---
-Metric 'call_time': ipfi_async (147.1μs) is 50.4% faster than grpc (296.5μs).
-Metric 'connect_time': ipfi_async (47.8μs) is 66.3% faster than grpc (141.7μs).
-Metric 'total_time': ipfi_async (195.3μs) is 55.5% faster than grpc (438.6μs)
+Metric 'call_time': ipfi_async (165.3μs) is 78.9% (1.8x) faster than grpc (295.8μs).
+Metric 'connect_time': ipfi_async (47.8μs) is 195.6% (3.0x) faster than grpc (141.2μs).
+Metric 'total_time': ipfi_async (213.6μs) is 104.8% (2.0x) faster than grpc (437.4μs).
 ```
 
-In this benchmark, **IPFI is 2.97x faster than gRPC** (with IPFI's synchronous API).
+In this benchmark, **IPFI is 2.63x faster than gRPC** (with IPFI's synchronous API).
