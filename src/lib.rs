@@ -1,4 +1,4 @@
-mod error;
+pub mod error;
 #[cfg(feature = "wire")]
 mod integer;
 mod interface_common;
@@ -102,3 +102,8 @@ pub(crate) enum CompleteLockState {
     /// an invalid state.
     Poisoned,
 }
+
+/// A type alias for the yielder functions you'll encounter in IPFI sequence procedures.
+pub type SequenceYielder<T> = Box<dyn Fn(T, bool) -> Result<(), error::Error> + Send + Sync + 'static>;
+/// A type alias for a raw yielder in IPFI, which yields bytes directly and controls its own chunking.
+pub type RawYielder = Box<dyn Fn(Vec<u8>, Terminator) -> Result<(), error::Error> + Send + Sync + 'static>;

@@ -151,13 +151,14 @@ macro_rules! define_interface {
                             // Timed out, check for poisons and start again
                             None => continue,
                             // Got something and we weren't poisoned when we last checked!
+                            // Note that `val` is an `Option<T>` here!
                             Some(val) => return Ok(val),
                         }
                     }
                 }
             }
             /// Waits to receive the next chunk, deserialising it into the given type. Generally, all chunks will be
-            /// deserialised into the same type, however it is perfeclty possible, if there is a known type layout,
+            /// deserialised into the same type, however it is perfectly possible, if there is a known type layout,
             /// to deserialise one chunk as one type and a different one as another, although this is not recommended
             /// except in highly deterministic systems.
             ///
@@ -301,8 +302,8 @@ macro_rules! define_interface {
             /// input.
             #[cfg(feature = "serde")]
             pub fn add_procedure<
-                A: Serialize + DeserializeOwned + Tuple,
-                R: Serialize + DeserializeOwned,
+                A: DeserializeOwned + Tuple,
+                R: Serialize,
             >(
                 &self,
                 idx: IpfiInteger,
@@ -338,8 +339,8 @@ macro_rules! define_interface {
             /// chunk. If you wish to send partial chunks, this should be done manually through `.add_raw_streaming_procedure()`.
             #[cfg(feature = "serde")]
             pub fn add_sequence_procedure<
-                A: Serialize + DeserializeOwned + Tuple,
-                R: Serialize + DeserializeOwned,
+                A: DeserializeOwned + Tuple,
+                R: Serialize,
             >(
                 &self,
                 idx: IpfiInteger,

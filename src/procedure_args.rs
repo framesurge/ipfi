@@ -70,7 +70,7 @@ pub trait Tuple {
 }
 macro_rules! impl_tuple {
     ($($p:ident),*) => {
-        impl<$($p: Serialize),*> Tuple for ($($p,)*)
+        impl<$($p),*> Tuple for ($($p,)*)
         {
             #[inline]
             fn len() -> u32 {
